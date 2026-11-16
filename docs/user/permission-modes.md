@@ -74,6 +74,8 @@ environment. Turning it off refuses the next script.
 | **Supervised**, **Auto-accept edits** | Ask first, showing the whole script. **Allow for this thread** stops asking in that thread. |
 | Plan mode                             | Refused.                                                                                    |
 
+A thread whose provider runs its mode as **Supervised** asks too.
+
 A script runs in the thread's project folder or worktree with T3 Code's own environment, and it
 stops after 10 minutes. Commands inside a script bypass the provider's own permission rules,
 hooks, and safety checks. Some providers may also ask before they call the tool. Turn Code Mode

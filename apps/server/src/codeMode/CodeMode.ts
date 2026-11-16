@@ -17,9 +17,11 @@ import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
+import { providerRuntimeMode } from "../orchestration-v2/RuntimePolicy.ts";
 import { t3OwnedRuntimeRequestId } from "../orchestration-v2/RuntimeRequestService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
+import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { codeModeDecision } from "./CodeModePolicy.ts";
 import * as CodeRunner from "./CodeRunner.ts";
@@ -60,7 +62,8 @@ export class CodeModeAskError extends Schema.TaggedError<CodeModeAskError>()("Co
   }
 }
 
-const ASK_TIMEOUT = Duration.minutes(60);
+// Under the 65-minute MCP tool timeout T3 gives Claude and Codex, with room for the run.
+const ASK_TIMEOUT = Duration.minutes(50);
 
 export class CodeModeNotApprovedError extends Schema.TaggedError<CodeModeNotApprovedError>()(
   "CodeModeNotApprovedError",
@@ -110,6 +113,7 @@ const make = Effect.gen(function* () {
   const settings = yield* ServerSettings.ServerSettingsService;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const projects = yield* ProjectService.ProjectService;
+  const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
   const runner = yield* CodeRunner.CodeRunner;
   const environment = yield* HostProcess.Environment;
   // One card at a time per thread, so "Allow for this thread" covers calls made in parallel.
@@ -201,7 +205,15 @@ const make = Effect.gen(function* () {
     if (!(yield* offered)) return yield* new CodeModeOffError();
     const shell = yield* threads.getThreadShell(threadId).pipe(Effect.orElseSucceed(() => null));
     if (shell === null) return yield* new CodeModeNoWorkspaceError({ threadId });
-    const decision = codeModeDecision(shell);
+    const instance = yield* providerInstances.getInstance(shell.modelSelection.instanceId);
+    const supportedRuntimeModes =
+      instance === undefined
+        ? undefined
+        : (yield* instance.snapshot.getSnapshot).supportedRuntimeModes;
+    const decision = codeModeDecision({
+      runtimeMode: providerRuntimeMode(shell.runtimeMode, supportedRuntimeModes),
+      interactionMode: shell.interactionMode,
+    });
     if (decision === "refuse") return yield* new CodeModeRefusedError();
     const cwd =
       shell.worktreePath ??

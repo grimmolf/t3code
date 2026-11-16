@@ -88,7 +88,8 @@ export const layer: Layer.Layer<RuntimePolicyV2> = Layer.succeed(RuntimePolicyV2
   }),
 });
 
-function providerRuntimeMode(
+/** The mode a thread really runs in: a mode its provider lacks runs as `approval-required`. */
+export function providerRuntimeMode(
   runtimeMode: RuntimeMode,
   supportedRuntimeModes: ReadonlyArray<RuntimeMode> | undefined,
 ): RuntimeMode {

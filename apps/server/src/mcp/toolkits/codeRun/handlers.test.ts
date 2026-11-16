@@ -17,6 +17,7 @@ import * as CodeMode from "../../../codeMode/CodeMode.ts";
 import * as CodeRunner from "../../../codeMode/CodeRunner.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
+import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
@@ -65,6 +66,9 @@ const call = Effect.fn("call")(function* (caller: {
         layerDependencies,
         ServerSettings.layerTest({ codeModeEnabled: caller.codeModeEnabled ?? true }),
         Layer.succeed(HostProcess.Environment, environment),
+        Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
+          getInstance: () => Effect.undefined,
+        }),
         Layer.mock(ProjectService.ProjectService)({
           getById: () => Effect.succeedSome({ workspaceRoot: "/home/user/acme" } as Project),
         }),

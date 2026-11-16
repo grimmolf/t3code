@@ -845,9 +845,25 @@ export const ClaudeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    codeMode: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Code Mode (experimental)",
+        description:
+          "Lets Claude run one JavaScript program per tool call to batch commands and edits. Scripts run outside Claude's Bash permission rules, its hooks, and T3 Code's removal guard.",
+        providerSettingsForm: { control: "switch" },
+      }),
+    ),
   },
   {
-    order: ["binaryPath", "homePath", "autoCompactWindow", "idleCompaction", "launchArgs"],
+    order: [
+      "binaryPath",
+      "homePath",
+      "autoCompactWindow",
+      "idleCompaction",
+      "codeMode",
+      "launchArgs",
+    ],
   },
 );
 export type ClaudeSettings = typeof ClaudeSettings.Type;

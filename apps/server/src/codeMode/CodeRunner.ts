@@ -78,7 +78,7 @@ interface Collected {
   readonly heldOpen: boolean;
 }
 
-const decodeChannel = (channel: Collected) => {
+const decodeChannel = (channel: Pick<Collected, "text" | "truncated">) => {
   const kind = channel.text.slice(0, 1);
   const body = channel.text.slice(1);
   return kind === "R"
@@ -165,7 +165,12 @@ const make = Effect.gen(function* () {
       ),
       maxBytes: RESPONSE_LIMIT_BYTES,
     }).pipe(Effect.orElseSucceed(() => empty));
-    return { text: collected.text, truncated: collected.truncated || heldOpen, heldOpen };
+    return {
+      text: collected.text,
+      truncated: collected.truncated || heldOpen,
+      capped: collected.truncated,
+      heldOpen,
+    };
   });
 
   const run = Effect.fn("CodeRunner.run")(function* (input: CodeRunInput) {
@@ -213,7 +218,8 @@ const make = Effect.gen(function* () {
         );
         yield* handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore);
         const [stdout, stderr, channel] = yield* Fiber.join(outputs);
-        const message = decodeChannel(channel);
+        // The runner writes its one message before it exits, so only the byte cap can cut it.
+        const message = decodeChannel({ text: channel.text, truncated: channel.capped });
         const ended = Option.isNone(exitCode)
           ? `The script ran longer than ${Duration.toMinutes(RUN_TIMEOUT)} minutes and was stopped.`
           : message === undefined
@@ -223,7 +229,8 @@ const make = Effect.gen(function* () {
               })} before returning.`
             : message.error;
         const heldOpen = stdout.heldOpen || stderr.heldOpen || channel.heldOpen;
-        const error = heldOpen ? (ended === null ? PIPES_HELD : `${ended}\n${PIPES_HELD}`) : ended;
+        // A script that returned succeeded; `truncated` alone says its output was cut.
+        const error = heldOpen && ended !== null ? `${ended}\n${PIPES_HELD}` : ended;
         return fitResponse({
           resultJson: Option.isNone(exitCode) ? null : (message?.resultJson ?? null),
           resultCut: message?.cut === true && message.resultJson !== null,

@@ -214,3 +214,20 @@ it.layer(layerTest)("CodeRunner", (it) => {
     }),
   );
 });
+
+// Live: the grace starts when the real process exits, which a test clock cannot observe.
+it.live("returns a script's value when a detached process it started holds the pipes", () =>
+  Effect.gen(function* () {
+    const output = yield* run(
+      `const child = require("node:child_process").spawn("sleep", ["15"], { detached: true, stdio: "inherit" });
+       child.unref();
+       return { value: 2, pid: child.pid };`,
+    );
+    const { value, pid } = output.result as { value: number; pid: number };
+    yield* Effect.addFinalizer(() => Effect.sync(() => isRunning(pid) && process.kill(pid)));
+
+    expect(value).toBe(2);
+    expect(output.error).toBeNull();
+    expect(output.truncated).toBe(true);
+  }).pipe(Effect.scoped, Effect.provide(layerTest)),
+);

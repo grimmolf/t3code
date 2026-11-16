@@ -3758,6 +3758,19 @@ const OrchestrationV2InternalCommand = Schema.Union([
     ),
   }),
   /**
+   * Opens an approval card that T3 answers itself, under the thread's running
+   * turn. Internal so no client can open one.
+   */
+  Schema.Struct({
+    type: Schema.Literal("runtime-request.open"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    requestId: RuntimeRequestId,
+    requestKind: ProviderRequestKind,
+    prompt: Schema.String,
+    options: Schema.Array(ProviderApprovalOption),
+  }),
+  /**
    * Internal so no client can mark a request saved without the value being
    * stored.
    */

@@ -48,6 +48,16 @@ export class RuntimeRequestResponseExecutionError extends Schema.TaggedError<Run
 
 const isRuntimeRequestResponseExecutionError = Schema.is(RuntimeRequestResponseExecutionError);
 
+// Adapter ids read `runtime-request:provider:…`, so this namespace cannot collide with them.
+const T3_OWNED_PREFIX = "runtime-request:t3:";
+
+/** A request T3 asks and answers itself; no provider session holds it. */
+export const t3OwnedRuntimeRequestId = (key: string) =>
+  RuntimeRequestId.make(`${T3_OWNED_PREFIX}${key}`);
+
+export const isT3OwnedRuntimeRequest = (requestId: RuntimeRequestId) =>
+  requestId.startsWith(T3_OWNED_PREFIX);
+
 export interface RuntimeRequestServiceV2Shape {
   readonly respond: (input: {
     readonly threadId: ThreadId;
@@ -77,6 +87,8 @@ export const layer: Layer.Layer<
     return RuntimeRequestServiceV2.of({
       respond: Effect.fn("RuntimeRequestService.respond")(
         function* (input) {
+          // Dispatch already recorded the answer that the request's asker waits for.
+          if (isT3OwnedRuntimeRequest(input.requestId)) return;
           const request = yield* projections.getRuntimeRequest(input.threadId, input.requestId);
           if (request === undefined) {
             return yield* new RuntimeRequestResponseExecutionError({

@@ -187,6 +187,7 @@ import { ProviderSessionManagerV2 } from "./ProviderSessionManager.ts";
 import { ProviderSwitchServiceV2 } from "./ProviderSwitchService.ts";
 import { isAutomaticCompletionRun, queuedRunsInDeliveryOrder } from "./QueuedRunOrder.ts";
 import { isRuntimePolicyAboveCeilingError, RuntimePolicyV2 } from "./RuntimePolicy.ts";
+import { isT3OwnedRuntimeRequest } from "./RuntimeRequestService.ts";
 import {
   endOrphanedNativeSubagent,
   endRunlessRootTurns,
@@ -687,6 +688,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "delegated_task.completion-delivery.dispose":
     case "thread.created.record":
       return command.parentThreadId;
+    case "runtime-request.open":
     case "secret_request.record":
     case "link_request.record":
       return command.threadId;
@@ -10434,6 +10436,109 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  const dispatchRuntimeRequestOpen = Effect.fn("Orchestrator.dispatchRuntimeRequestOpen")(
+    function* (
+      command: Extract<OrchestrationV2InternalCommand, { readonly type: "runtime-request.open" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const fail = (cause: string) =>
+        new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause,
+        });
+      if (!isT3OwnedRuntimeRequest(command.requestId)) {
+        return yield* fail(`Runtime request ${command.requestId} is not one T3 answers.`);
+      }
+      const projectionError = (cause: OrchestratorProjectionError["cause"]) =>
+        new OrchestratorProjectionError({ threadId: command.threadId, cause });
+      const { run, providerThread, providerTurn } = yield* projectionStore
+        .getRunningTurnContext(command.threadId)
+        .pipe(Effect.mapError(projectionError));
+      const providerSessionId = providerThread?.providerSessionId ?? null;
+      if (run === undefined || run.rootNodeId === null || providerThread === undefined) {
+        return yield* fail(`Thread ${command.threadId} has no running turn to ask in.`);
+      }
+      if (providerSessionId === null) {
+        return yield* fail(`Provider thread ${providerThread.id} has no live session.`);
+      }
+      const now = yield* DateTime.now;
+      const nodeId = idAllocator.derive.approvalNode({ requestId: command.requestId });
+      const base = {
+        threadId: command.threadId,
+        runId: run.id,
+        nodeId,
+        providerInstanceId: run.providerInstanceId,
+        occurredAt: now,
+      };
+      const emitEvent = emit(events, command);
+      yield* emitEvent({
+        ...base,
+        type: "node.updated",
+        payload: {
+          id: nodeId,
+          threadId: command.threadId,
+          runId: run.id,
+          parentNodeId: run.rootNodeId,
+          rootNodeId: run.rootNodeId,
+          kind: "approval_request",
+          status: "waiting",
+          countsForRun: false,
+          providerThreadId: providerThread.id,
+          providerTurnId: providerTurn?.id ?? null,
+          nativeItemRef: null,
+          runtimeRequestId: command.requestId,
+          checkpointScopeId: null,
+          startedAt: now,
+          completedAt: null,
+        },
+      });
+      yield* emitEvent({
+        ...base,
+        type: "runtime-request.updated",
+        payload: {
+          id: command.requestId,
+          nodeId,
+          providerTurnId: providerTurn?.id ?? null,
+          nativeRequestRef: null,
+          kind: command.requestKind,
+          status: "pending",
+          // Live on the turn's session, so clients answer it and a released session closes it.
+          responseCapability: { type: "live", providerSessionId },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      });
+      yield* emitEvent({
+        ...base,
+        type: "turn-item.updated",
+        payload: {
+          id: idAllocator.derive.approvalTurnItem({ requestId: command.requestId }),
+          threadId: command.threadId,
+          runId: run.id,
+          nodeId,
+          providerThreadId: providerThread.id,
+          providerTurnId: providerTurn?.id ?? null,
+          nativeItemRef: null,
+          parentItemId: null,
+          ordinal: yield* projectionStore
+            .getNextTurnItemOrdinal(command.threadId)
+            .pipe(Effect.mapError(projectionError)),
+          status: "waiting",
+          title: null,
+          startedAt: now,
+          completedAt: null,
+          updatedAt: now,
+          type: "approval_request",
+          requestId: command.requestId,
+          requestKind: command.requestKind,
+          prompt: command.prompt,
+          options: command.options,
+        },
+      });
+    },
+  );
+
   const dispatchSecretRequestRecord = Effect.fn("orchestrationV2.dispatch.secretRequestRecord")(
     function* (
       command: Extract<OrchestrationV2InternalCommand, { readonly type: "secret_request.record" }>,
@@ -15325,6 +15430,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         break;
       case "thread.created.record":
         yield* dispatchCreatedThreadRecord(command, events);
+        break;
+      case "runtime-request.open":
+        yield* dispatchRuntimeRequestOpen(command, events);
         break;
       case "secret_request.record":
         yield* dispatchSecretRequestRecord(command, events);

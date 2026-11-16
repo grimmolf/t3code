@@ -392,7 +392,7 @@ const toolNameCache = new Map<string, string | null>();
 const TOOL_NAME_CACHE_LIMIT = 10_000;
 const TOOL_NAME_CACHE_MAX_KEY_LENGTH = 256;
 
-function resolveT3McpToolName(value: string): string | null {
+export function resolveT3McpToolName(value: string): string | null {
   if (value.length > TOOL_NAME_CACHE_MAX_KEY_LENGTH) return parseT3McpToolName(value);
   const cached = toolNameCache.get(value);
   if (cached !== undefined) return cached;

@@ -1,5 +1,7 @@
 import type { ToolLifecycleItemType } from "@t3tools/contracts";
 
+import { resolveT3McpToolName } from "./t3McpToolPresentation.ts";
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -24,8 +26,18 @@ export function claudeSkillInvocation(
   return name === undefined ? undefined : { name, args: asTrimmedString(record?.args) };
 }
 
+const T3_CODE_RUN_TOOL_NAME = "t3_code_run";
+
+const isT3CodeRunTool = (toolName: string | null | undefined) =>
+  toolName != null && resolveT3McpToolName(toolName) === T3_CODE_RUN_TOOL_NAME;
+
 export function isJavaScriptReplTool(toolName: string | null | undefined): boolean {
-  return toolName === "js" || toolName === "cua_repl.js" || toolName === "node_repl.js";
+  return (
+    toolName === "js" ||
+    toolName === "cua_repl.js" ||
+    toolName === "node_repl.js" ||
+    isT3CodeRunTool(toolName)
+  );
 }
 
 export const COMPUTER_USE_TOOL_SOURCE = {
@@ -36,6 +48,7 @@ export const COMPUTER_USE_TOOL_SOURCE = {
 
 export function dynamicToolSurface(toolName: string | null | undefined, input: unknown) {
   if (toolName === "cua_repl.js") return "computer" as const;
+  if (isT3CodeRunTool(toolName)) return undefined;
   const code = asRecord(input)?.code;
   return isJavaScriptReplTool(toolName) &&
     typeof code === "string" &&

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { classifyToolActivity, dynamicToolSurface, mergeToolActivityData } from "./toolActivity.ts";
+import {
+  classifyToolActivity,
+  dynamicToolSurface,
+  dynamicToolTitle,
+  isJavaScriptReplTool,
+  mergeToolActivityData,
+} from "./toolActivity.ts";
 
 describe("toolActivity", () => {
   it("classifies from kind and toolName without sniffing titles", () => {
@@ -44,5 +50,17 @@ describe("toolActivity", () => {
       expect(dynamicToolSurface(name, { code: "await fs.readFile(path);" })).toBeUndefined();
     }
     expect(dynamicToolSurface("github.js", { code: "await sky.click(app);" })).toBeUndefined();
+  });
+
+  it("presents T3's code tool as a JavaScript run under the names providers report", () => {
+    for (const name of ["mcp__t3-code__t3_code_run", "t3-code.t3_code_run"]) {
+      expect(isJavaScriptReplTool(name)).toBe(true);
+      expect(dynamicToolTitle(name, { code: "return 1", title: "Rename helpers" })).toBe(
+        "Rename helpers",
+      );
+      expect(dynamicToolTitle(name, { code: "return 1" })).toBe("Run JavaScript");
+      expect(dynamicToolSurface(name, { code: "await sky.click(app);" })).toBeUndefined();
+    }
+    expect(isJavaScriptReplTool("mcp__github__t3_code_run")).toBe(false);
   });
 });

@@ -22,6 +22,7 @@ import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -271,10 +272,14 @@ const startNextRun = Effect.fn("startNextRun")(function* (threadId: ThreadId, na
   } as OrchestrationV2DomainEvent);
 });
 
+type Threads = ThreadManagementService.ThreadManagementService["Service"];
+
 const withCodeMode = <A, E, R>(
   use: (codeMode: CodeMode.CodeMode["Service"], runs: Array<string>) => Effect.Effect<A, E, R>,
   options: {
     readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+    /** Wraps the thread service Code Mode sees; the test body keeps the real one. */
+    readonly threads?: (threads: Threads) => Threads;
   } = {},
 ) => {
   const runs: Array<string> = [];
@@ -290,6 +295,13 @@ const withCodeMode = <A, E, R>(
       CodeMode.layer.pipe(
         Layer.provide(
           Layer.mergeAll(
+            Layer.effect(
+              ThreadManagementService.ThreadManagementService,
+              Effect.map(
+                ThreadManagementService.ThreadManagementService,
+                options.threads ?? ((t) => t),
+              ),
+            ),
             Layer.mock(ProjectService.ProjectService)({}),
             Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
               getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
@@ -434,71 +446,107 @@ it.effect("asks where the running turn's provider may not run the thread's mode"
 
 it.effect("runs nothing when the user declines, the call is cancelled, or the turn stops", () =>
   Effect.gen(function* () {
-    yield* withCodeMode((codeMode, runs) =>
-      Effect.gen(function* () {
-        const threads = yield* ThreadManagementService.ThreadManagementService;
-        const settings = yield* ServerSettings.ServerSettingsService;
-        const { threadId, runId } = yield* startTurn("refuse");
-        const statusOf = (requestId: RuntimeRequestId) =>
-          threads
-            .getThreadRecords(threadId, ["runtimeRequests", "turnItems"], {
-              turnItemRequestIds: [requestId],
-            })
-            .pipe(
-              Effect.map((records) => [
-                records.runtimeRequests.find((request) => request.id === requestId)?.status,
-                records.turnItems[0]?.status,
-              ]),
-            );
+    // Holds the next card's open after it commits, so the call can be cancelled right there.
+    const opening = {
+      armed: false,
+      requestId: undefined as RuntimeRequestId | undefined,
+      committed: yield* Deferred.make<void>(),
+      release: yield* Deferred.make<void>(),
+    };
+    const threadsHeldAtOpen = (threads: Threads): Threads => ({
+      ...threads,
+      dispatch: (command) =>
+        command.type === "runtime-request.open" && opening.armed
+          ? threads.dispatch(command).pipe(
+              Effect.tap(() => {
+                opening.armed = false;
+                opening.requestId = command.requestId;
+                return Deferred.succeed(opening.committed, undefined).pipe(
+                  Effect.andThen(Deferred.await(opening.release)),
+                );
+              }),
+            )
+          : threads.dispatch(command),
+    });
+    yield* withCodeMode(
+      (codeMode, runs) =>
+        Effect.gen(function* () {
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          const settings = yield* ServerSettings.ServerSettingsService;
+          const { threadId, runId } = yield* startTurn("refuse");
+          const statusOf = (requestId: RuntimeRequestId) =>
+            threads
+              .getThreadRecords(threadId, ["runtimeRequests", "turnItems"], {
+                turnItemRequestIds: [requestId],
+              })
+              .pipe(
+                Effect.map((records) => [
+                  records.runtimeRequests.find((request) => request.id === requestId)?.status,
+                  records.turnItems[0]?.status,
+                ]),
+              );
 
-        const declined = yield* startAsking(codeMode, threadId, "return 'declined'");
-        yield* respond(threadId, declined.requestId, "decline");
-        assert.equal(refusal(yield* Fiber.await(declined.script)), "declined");
+          const declined = yield* startAsking(codeMode, threadId, "return 'declined'");
+          yield* respond(threadId, declined.requestId, "decline");
+          assert.equal(refusal(yield* Fiber.await(declined.script)), "declined");
 
-        const cancelled = yield* startAsking(codeMode, threadId, "return 'cancelled'");
-        yield* Fiber.interrupt(cancelled.script);
-        assert.deepEqual(yield* statusOf(cancelled.requestId), ["resolved", "cancelled"]);
+          const cancelled = yield* startAsking(codeMode, threadId, "return 'cancelled'");
+          yield* Fiber.interrupt(cancelled.script);
+          assert.deepEqual(yield* statusOf(cancelled.requestId), ["resolved", "cancelled"]);
 
-        const planned = yield* startAsking(codeMode, threadId, "return 'planned'");
-        yield* threads.dispatch({
-          type: "thread.interaction-mode.set",
-          commandId: CommandId.make("plan:refuse"),
-          threadId,
-          interactionMode: "plan",
-        });
-        yield* respond(threadId, planned.requestId, "accept");
-        assert.equal(refusal(yield* Fiber.await(planned.script)), "CodeModeRefusedError");
-        yield* threads.dispatch({
-          type: "thread.interaction-mode.set",
-          commandId: CommandId.make("default:refuse"),
-          threadId,
-          interactionMode: "default",
-        });
+          opening.armed = true;
+          const cancelledAtOpen = yield* codeMode
+            .run(threadId, "return 'cancelled at open'")
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(opening.committed);
+          yield* Fiber.interrupt(cancelledAtOpen).pipe(
+            Effect.forkChild({ startImmediately: true }),
+          );
+          yield* Deferred.succeed(opening.release, undefined);
+          yield* Fiber.await(cancelledAtOpen);
+          assert.deepEqual(yield* statusOf(opening.requestId!), ["resolved", "cancelled"]);
 
-        const turnedOff = yield* startAsking(codeMode, threadId, "return 'turned off'");
-        yield* settings.updateSettings({ codeModeEnabled: false });
-        yield* respond(threadId, turnedOff.requestId, "accept");
-        assert.equal(refusal(yield* Fiber.await(turnedOff.script)), "CodeModeOffError");
-        yield* settings.updateSettings({ codeModeEnabled: true });
+          const planned = yield* startAsking(codeMode, threadId, "return 'planned'");
+          yield* threads.dispatch({
+            type: "thread.interaction-mode.set",
+            commandId: CommandId.make("plan:refuse"),
+            threadId,
+            interactionMode: "plan",
+          });
+          yield* respond(threadId, planned.requestId, "accept");
+          assert.equal(refusal(yield* Fiber.await(planned.script)), "CodeModeRefusedError");
+          yield* threads.dispatch({
+            type: "thread.interaction-mode.set",
+            commandId: CommandId.make("default:refuse"),
+            threadId,
+            interactionMode: "default",
+          });
 
-        // The calling turn ends and another starts while its card stays open.
-        const ended = yield* startTurn("ended");
-        const orphaned = yield* startAsking(codeMode, ended.threadId, "return 'orphaned'");
-        yield* startNextRun(ended.threadId, "ended-next");
-        yield* respond(ended.threadId, orphaned.requestId, "accept");
-        assert.equal(refusal(yield* Fiber.await(orphaned.script)), "CodeModeTurnEndedError");
+          const turnedOff = yield* startAsking(codeMode, threadId, "return 'turned off'");
+          yield* settings.updateSettings({ codeModeEnabled: false });
+          yield* respond(threadId, turnedOff.requestId, "accept");
+          assert.equal(refusal(yield* Fiber.await(turnedOff.script)), "CodeModeOffError");
+          yield* settings.updateSettings({ codeModeEnabled: true });
 
-        const stopped = yield* startAsking(codeMode, threadId, "return 'stopped'");
-        yield* threads.dispatch({
-          type: "run.interrupt",
-          commandId: CommandId.make("interrupt:refuse"),
-          threadId,
-          runId,
-        });
-        assert.equal(refusal(yield* Fiber.await(stopped.script)), "closed");
-        assert.deepEqual(yield* statusOf(stopped.requestId), ["cancelled", "interrupted"]);
-        assert.deepEqual(runs, []);
-      }),
+          // The calling turn ends and another starts while its card stays open.
+          const ended = yield* startTurn("ended");
+          const orphaned = yield* startAsking(codeMode, ended.threadId, "return 'orphaned'");
+          yield* startNextRun(ended.threadId, "ended-next");
+          yield* respond(ended.threadId, orphaned.requestId, "accept");
+          assert.equal(refusal(yield* Fiber.await(orphaned.script)), "CodeModeTurnEndedError");
+
+          const stopped = yield* startAsking(codeMode, threadId, "return 'stopped'");
+          yield* threads.dispatch({
+            type: "run.interrupt",
+            commandId: CommandId.make("interrupt:refuse"),
+            threadId,
+            runId,
+          });
+          assert.equal(refusal(yield* Fiber.await(stopped.script)), "closed");
+          assert.deepEqual(yield* statusOf(stopped.requestId), ["cancelled", "interrupted"]);
+          assert.deepEqual(runs, []);
+        }),
+      { threads: threadsHeldAtOpen },
     );
   }).pipe(Effect.provide(layerTest)),
 );

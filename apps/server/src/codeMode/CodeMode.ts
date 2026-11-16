@@ -172,18 +172,6 @@ const make = Effect.gen(function* () {
     if (yield* allowedForThread(threadId)) return;
     const requestId = t3OwnedRuntimeRequestId(`code-run:${yield* randomUuidV4}`);
     const askError = (cause: unknown) => new CodeModeAskError({ threadId, cause });
-    const opened = yield* threads
-      .dispatch({
-        type: "runtime-request.open",
-        commandId: CommandId.make(`command:${requestId}:open`),
-        threadId,
-        requestId,
-        requestKind: "command",
-        prompt: code,
-        options: CODE_RUN_APPROVAL_OPTIONS,
-      })
-      .pipe(Effect.mapError(askError));
-    // A pending card must not outlive this call: a timeout, a failed wait or a cancelled call closes it.
     const close = threads
       .dispatch({
         type: "runtime-request.respond",
@@ -199,14 +187,25 @@ const make = Effect.gen(function* () {
           }),
         ),
       );
-    const answer = yield* awaitAnswer(threadId, requestId, opened.sequence).pipe(
-      Effect.timeoutOption(ASK_TIMEOUT),
-      Effect.map(Option.flatten),
-      Effect.onExit((exit) =>
-        Exit.isSuccess(exit) && Option.isSome(exit.value) ? Effect.void : close,
-      ),
-      Effect.mapError(askError),
-    );
+    // A pending card must not outlive this call. The open is uninterruptible, so a call
+    // cancelled while it commits still closes the card.
+    const answer = yield* Effect.acquireUseRelease(
+      threads.dispatch({
+        type: "runtime-request.open",
+        commandId: CommandId.make(`command:${requestId}:open`),
+        threadId,
+        requestId,
+        requestKind: "command",
+        prompt: code,
+        options: CODE_RUN_APPROVAL_OPTIONS,
+      }),
+      (opened) =>
+        awaitAnswer(threadId, requestId, opened.sequence).pipe(
+          Effect.timeoutOption(ASK_TIMEOUT),
+          Effect.map(Option.flatten),
+        ),
+      (_opened, exit) => (Exit.isSuccess(exit) && Option.isSome(exit.value) ? Effect.void : close),
+    ).pipe(Effect.mapError(askError));
     if (Option.isNone(answer)) return yield* new CodeModeNotApprovedError({ outcome: "timed_out" });
     const { status, decision } = answer.value;
     if (status === "resolved" && (decision === "accept" || decision === "acceptForSession")) return;

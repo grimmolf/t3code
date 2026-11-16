@@ -46,6 +46,7 @@ const call = Effect.fn("call")(function* (caller: {
   readonly codeModeEnabled?: boolean;
   readonly client?: boolean;
   readonly platform?: NodeJS.Platform;
+  readonly code?: string;
 }) {
   const runs: Array<CodeRunner.CodeRunInput> = [];
   const shell = { ...liveThreadShell(threadId), projectId: ProjectId.make("project:acme") };
@@ -97,7 +98,7 @@ const call = Effect.fn("call")(function* (caller: {
   );
   const result = yield* Effect.gen(function* () {
     const toolkit = yield* CodeRunToolkit;
-    return yield* toolkit.handle("t3_code_run", { code: "return 12" }).pipe(
+    return yield* toolkit.handle("t3_code_run", { code: caller.code ?? "return 12" }).pipe(
       Stream.unwrap,
       Stream.runCollect,
       Effect.map((parts) => parts.at(-1)?.result),
@@ -123,13 +124,15 @@ it.effect("runs a thread's script in its workspace with the server's environment
 it.effect("refuses every caller Code Mode is not for, before anything runs", () =>
   Effect.gen(function* () {
     const refusals = [
-      [{ client: true }, "thread_credential_required"],
-      [{ codeModeEnabled: false }, "capability_denied"],
-      [{ platform: "win32" }, "capability_denied"],
+      [{ client: true }, { code: "thread_credential_required" }],
+      [{ codeModeEnabled: false }, { code: "capability_denied" }],
+      [{ platform: "win32" }, { code: "capability_denied" }],
+      // Under 65,536 characters, but 80,000 bytes of UTF-8.
+      [{ code: "é".repeat(40_000) }, { reason: { _tag: "ToolParameterValidationError" } }],
     ] as const;
-    for (const [caller, code] of refusals) {
+    for (const [caller, refusal] of refusals) {
       const { result, runs } = yield* call(caller);
-      expect(result).toMatchObject({ code });
+      expect(result).toMatchObject(refusal);
       expect(runs).toEqual([]);
     }
   }),

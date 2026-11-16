@@ -30,6 +30,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 
 import { CodexProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/CodexAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
@@ -444,7 +445,61 @@ it.effect("asks for each script until the user allows the thread", () =>
   ),
 );
 
-it.effect("queues a second script behind the first card, then asks for it", () =>
+it.effect("asks for a script whose thread moved to Supervised after the call began", () => {
+  // The first read sees Full access; every later read sees the thread's real Supervised mode.
+  const shellReads = new Map<ThreadId, number>();
+  const firstReadFullAccess = (threads: Threads): Threads => ({
+    ...threads,
+    getThreadShell: (threadId) =>
+      threads.getThreadShell(threadId).pipe(
+        Effect.map((shell) => {
+          const reads = (shellReads.get(threadId) ?? 0) + 1;
+          shellReads.set(threadId, reads);
+          return reads === 1 && shell !== null
+            ? { ...shell, runtimeMode: "full-access" as const }
+            : shell;
+        }),
+      ),
+  });
+  return withCodeMode(
+    (codeMode, runs) =>
+      Effect.gen(function* () {
+        const { threadId } = yield* startTurn("moved-to-supervised");
+        const asked = yield* startAsking(codeMode, threadId, "return 'moved'");
+        assert.deepEqual(runs, []);
+        yield* respond(threadId, asked.requestId, "accept");
+        yield* Fiber.join(asked.script);
+        assert.deepEqual(runs, ["return 'moved'"]);
+      }),
+    { threads: firstReadFullAccess },
+  ).pipe(Effect.provide(layerTest));
+});
+
+it.effect("times out a queued script within one deadline and leaves no card open", () =>
+  withCodeMode((codeMode, runs) =>
+    Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const { threadId } = yield* startTurn("queued-deadline");
+      const waiting = yield* startAsking(codeMode, threadId, "return 'waiting'");
+      const behind = yield* codeMode
+        .run(threadId, "return 'behind'")
+        .pipe(Effect.exit, Effect.forkChild);
+
+      yield* TestClock.adjust("50 minutes");
+
+      assert.equal(refusal(yield* Fiber.await(waiting.script)), "timed_out");
+      assert.equal(refusal(yield* Fiber.join(behind)), "timed_out");
+      const { runtimeRequests } = yield* threads.getThreadRecords(threadId, ["runtimeRequests"]);
+      assert.deepEqual(
+        runtimeRequests.filter((request) => request.status === "pending"),
+        [],
+      );
+      assert.deepEqual(runs, []);
+    }),
+  ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("asks for each queued script in turn", () =>
   withCodeMode((codeMode, runs) =>
     Effect.gen(function* () {
       const threads = yield* ThreadManagementService.ThreadManagementService;

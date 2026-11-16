@@ -8,6 +8,7 @@ import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -85,7 +86,7 @@ export class CodeModeNotApprovedError extends Schema.TaggedError<CodeModeNotAppr
       case "closed":
         return "The approval request closed before the user answered, so the script did not run.";
       case "timed_out":
-        return `No one answered the approval request within ${Duration.toMinutes(ASK_TIMEOUT)} minutes, so the script did not run.`;
+        return `No approval came within ${Duration.toMinutes(ASK_TIMEOUT)} minutes, so the script did not run.`;
     }
   }
 }
@@ -242,6 +243,8 @@ const make = Effect.gen(function* () {
 
   const run = Effect.fn("CodeMode.run")(function* (threadId: ThreadId, code: string) {
     const { runId } = yield* permit(threadId);
+    // One deadline for the whole call: queueing behind other cards and waiting for this one.
+    const deadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(ASK_TIMEOUT);
     // The setting, the thread's mode and the turn can all change while a call waits.
     const current = permit(threadId).pipe(
       Effect.filterOrFail(
@@ -263,7 +266,7 @@ const make = Effect.gen(function* () {
         if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
         return yield* runner.run({ code, cwd, environment });
       }
-      // One deadline covers queueing behind another call's card and waiting for this one.
+      const remaining = Duration.millis(Math.max(0, deadline - (yield* Clock.currentTimeMillis)));
       const asked = yield* askLocks
         .withLock(
           threadId,
@@ -273,7 +276,7 @@ const make = Effect.gen(function* () {
             return true;
           }),
         )
-        .pipe(Effect.timeoutOption(ASK_TIMEOUT));
+        .pipe(Effect.timeoutOption(remaining));
       if (Option.isNone(asked)) {
         return yield* new CodeModeNotApprovedError({ outcome: "timed_out" });
       }

@@ -291,7 +291,7 @@ After the change, the first reference to a file is an absolute link. The remaini
 
 ## Code Mode cases
 
-`cases/code-mode.ndjson` checks when Claude picks `t3_code_run`. `setup.codeMode` lists the tool, loaded up front as T3 does, only in these Claude cases. The `bad` case renames a function across 12 modules and should be one script, not `sed -i` or `perl -pi` one-liners. The control is a single edit, which should not use a script. A mock answers each script; nothing runs, so these cases measure the choice of tool, not its result. They have no recorded results yet.
+`cases/code-mode.ndjson` checks when an agent picks `t3_code_run`. `setup.codeMode` lists the tool only in these cases, on either harness. Claude gets it loaded up front, as T3 does. Codex calls it from a code cell here, though T3 registers it on Codex's direct-only server, as it does `delegate_task`. The `bad` case renames a function across 12 modules and should be one script, not `sed -i` or `perl -pi` one-liners. The control is a single edit, which should not use a script. A mock answers each script; nothing runs, so these cases measure the choice of tool, not its result. They have no recorded results yet.
 
 ## Where T3's text lives
 

@@ -310,7 +310,7 @@ export const McpToolUseCase = Schema.Struct({
     harness: Schema.optional(Schema.Literals(["claude", "codex"])),
     /** The Linked environments beta is on, so T3 lists its link tools. */
     linkedEnvironments: Schema.optional(Schema.Boolean),
-    /** The thread's Claude instance has Code Mode on, so T3 lists t3_code_run. Claude only. */
+    /** Code Mode is on, so T3 lists t3_code_run. */
     codeMode: Schema.optional(Schema.Boolean),
     /** delegate_task `role` for a delegated child. T3 builds the child's first message from it. */
     delegateRole: Schema.optional(OrchestratorMcpTaskRole),
@@ -519,7 +519,7 @@ const pastedSecret = (name: string, input: Readonly<Record<string, unknown>>) =>
 const hiddenFromSubagents = enabledWhen(McpInvocationContext.hiddenFromSubagents);
 // The Linked environments beta starts off, and T3 lists its tools only while it is on.
 const hiddenWhileLinksOff = enabledWhen(McpInvocationContext.hiddenWhileLinksOff);
-// T3 lists these only to a Claude thread whose instance has Code Mode on.
+// T3 lists these only while Code Mode is on.
 const codeModeTools = new Set(
   Object.values(CodeRunToolkit.tools).map((tool: Tool.Any) => `${T3_PREFIX}${tool.name}`),
 );
@@ -739,6 +739,7 @@ const buildCodexBase = (
     readonly effort?: string | undefined;
     readonly subagent?: boolean;
     readonly links?: boolean;
+    readonly codeMode?: boolean;
     /** false: the thread has no agent device access, so T3's text leaves devices out. */
     readonly deviceAccess?: boolean;
     /** false: the thread has no agent browser access, so T3's text leaves the browser out. */
@@ -2584,6 +2585,7 @@ const main = Effect.gen(function* () {
               effort: flags.effort,
               subagent: role === "delegated-child",
               links,
+              codeMode,
               deviceAccess,
               browserAccess,
             }),
@@ -2610,7 +2612,7 @@ const main = Effect.gen(function* () {
         );
   // Codex has no native subagents; its cases with that role run as top-level threads.
   const baseKey = ({ setup }: McpToolUseCase) =>
-    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.world?.browserAgentAccess !== false}:${setup.linkedEnvironments === true}:${!codex && setup.codeMode === true}`;
+    `${codex && setup.role === "native-subagent" ? "top" : setup.role}:${setup.world?.deviceAgentAccess !== false}:${setup.world?.browserAgentAccess !== false}:${setup.linkedEnvironments === true}:${setup.codeMode === true}`;
   const base = yield* buildFor("top", true, true, false, false);
   const bases = new Map<string, Base>([["top:true:true:false:false", base]]);
   for (const testCase of selected) {

@@ -1,4 +1,5 @@
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -46,6 +47,10 @@ export class CodeRunner extends Context.Service<
 >()("t3/codeMode/CodeRunner") {}
 
 export const RUN_TIMEOUT = Duration.minutes(10);
+/** How long output may keep arriving once the script ends or is stopped. */
+export const PIPE_GRACE = Duration.seconds(2);
+const PIPES_HELD =
+  "Output was cut off because a background process the script started kept its output open.";
 export const RESPONSE_LIMIT_BYTES = 64 * 1024;
 const TRUNCATED_MARKER = "\n[truncated]";
 
@@ -69,6 +74,8 @@ const cutToFit = (text: string, maxBytes: number): string => {
 interface Collected {
   readonly text: string;
   readonly truncated: boolean;
+  /** The grace ran out before the stream ended. */
+  readonly heldOpen: boolean;
 }
 
 const decodeChannel = (channel: Collected) => {
@@ -129,7 +136,7 @@ const fitResponse = (input: {
   };
 };
 
-const empty: Collected = { text: "", truncated: false };
+const empty: Collected = { text: "", truncated: false, heldOpen: false };
 
 // The same prefixes the terminal keeps from shells, plus the MCP credentials.
 const isServerOnlyVariable = (name: string) => {
@@ -145,10 +152,21 @@ const make = Effect.gen(function* () {
   const executablePath = yield* HostProcess.ExecutablePath;
 
   // Every stream drains to its end even past the cap, or the runner would block on a full pipe.
-  const collect = (stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>) =>
-    collectUint8StreamText({ stream, maxBytes: RESPONSE_LIMIT_BYTES }).pipe(
-      Effect.orElseSucceed(() => empty),
-    );
+  const collect = Effect.fnUntraced(function* (
+    stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>,
+    graceOver: Deferred.Deferred<void>,
+  ) {
+    let heldOpen = false;
+    const collected = yield* collectUint8StreamText({
+      stream: stream.pipe(
+        Stream.interruptWhen(
+          Deferred.await(graceOver).pipe(Effect.tap(() => Effect.sync(() => (heldOpen = true)))),
+        ),
+      ),
+      maxBytes: RESPONSE_LIMIT_BYTES,
+    }).pipe(Effect.orElseSucceed(() => empty));
+    return { text: collected.text, truncated: collected.truncated || heldOpen, heldOpen };
+  });
 
   const run = Effect.fn("CodeRunner.run")(function* (input: CodeRunInput) {
     const environment: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: "1" };
@@ -171,8 +189,13 @@ const make = Effect.gen(function* () {
             Effect.mapError((cause) => new CodeRunStartError({ cause })),
             Effect.catchDefect((cause) => Effect.fail(new CodeRunStartError({ cause }))),
           );
+        const graceOver = yield* Deferred.make<void>();
         const outputs = yield* Effect.all(
-          [collect(handle.stdout), collect(handle.stderr), collect(handle.getOutputFd(3))],
+          [
+            collect(handle.stdout, graceOver),
+            collect(handle.stderr, graceOver),
+            collect(handle.getOutputFd(3), graceOver),
+          ],
           { concurrency: "unbounded" },
         ).pipe(Effect.forkScoped);
         yield* Stream.run(Stream.encodeText(Stream.make(input.code)), handle.stdin).pipe(
@@ -182,11 +205,16 @@ const make = Effect.gen(function* () {
           Effect.option,
           Effect.timeoutOption(RUN_TIMEOUT),
         );
-        // Descendants still holding the pipes would keep the collectors open.
+        // Armed before the kill, which waits on the process: a detached descendant outside its
+        // group can hold the pipes open for as long as it runs.
+        yield* Effect.sleep(PIPE_GRACE).pipe(
+          Effect.andThen(Deferred.succeed(graceOver, undefined)),
+          Effect.forkScoped,
+        );
         yield* handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore);
         const [stdout, stderr, channel] = yield* Fiber.join(outputs);
         const message = decodeChannel(channel);
-        const error = Option.isNone(exitCode)
+        const ended = Option.isNone(exitCode)
           ? `The script ran longer than ${Duration.toMinutes(RUN_TIMEOUT)} minutes and was stopped.`
           : message === undefined
             ? `The script exited${Option.match(exitCode.value, {
@@ -194,6 +222,8 @@ const make = Effect.gen(function* () {
                 onSome: (code) => ` with code ${code}`,
               })} before returning.`
             : message.error;
+        const heldOpen = stdout.heldOpen || stderr.heldOpen || channel.heldOpen;
+        const error = heldOpen ? (ended === null ? PIPES_HELD : `${ended}\n${PIPES_HELD}`) : ended;
         return fitResponse({
           resultJson: Option.isNone(exitCode) ? null : (message?.resultJson ?? null),
           resultCut: message?.cut === true && message.resultJson !== null,

@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
@@ -41,8 +42,10 @@ const isRunning = (pid: number) => {
   }
 };
 
+const shellChild = `const pid = (await $\`sleep 300 >/dev/null 2>&1 & echo $!\`.text()).trim();`;
+
 /** A socket the script reports its background child's PID to, once that child runs. */
-const pidReport = Effect.fn("pidReport")(function* () {
+const pidReport = Effect.fn("pidReport")(function* (startChild: string = shellChild) {
   const path = yield* Path.Path;
   const socketPath = path.join(yield* workspace(), "pid.sock");
   const reported = yield* Deferred.make<number>();
@@ -58,7 +61,7 @@ const pidReport = Effect.fn("pidReport")(function* () {
     () => Effect.sync(() => server.close()),
   );
   const script = [
-    `const pid = (await $\`sleep 300 >/dev/null 2>&1 & echo $!\`.text()).trim();`,
+    startChild,
     `await new Promise((resolve) => require("node:net").connect(${JSON.stringify(socketPath)}).end(pid, resolve));`,
     `await new Promise((resolve) => setTimeout(resolve, 3_600_000));`,
   ].join("\n");
@@ -166,6 +169,25 @@ it.layer(layerTest)("CodeRunner", (it) => {
 
       expect(output.error).toBe("The script ran longer than 10 minutes and was stopped.");
       expect(isRunning(pid)).toBe(false);
+    }),
+  );
+
+  it.effect("returns once the grace ends while a detached process holds the pipes", () =>
+    Effect.gen(function* () {
+      const report = yield* pidReport(
+        `const pid = String(require("node:child_process").spawn("sleep", ["15"], { detached: true, stdio: "inherit" }).pid);`,
+      );
+      const fiber = yield* run(report.script).pipe(Effect.forkChild);
+      const pid = yield* report.pid;
+      yield* Effect.addFinalizer(() => Effect.sync(() => isRunning(pid) && process.kill(pid)));
+
+      yield* TestClock.adjust(Duration.sum(CodeRunner.RUN_TIMEOUT, CodeRunner.PIPE_GRACE));
+      const output = yield* Fiber.join(fiber);
+
+      expect(output.truncated).toBe(true);
+      expect(output.error).toBe(
+        "The script ran longer than 10 minutes and was stopped.\nOutput was cut off because a background process the script started kept its output open.",
+      );
     }),
   );
 

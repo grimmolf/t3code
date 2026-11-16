@@ -1,7 +1,7 @@
 import type { ProviderInteractionMode, RuntimeMode } from "@t3tools/contracts";
 
 /** What a `t3_code_run` call does in a thread: run unasked, ask the user first, or refuse. */
-type CodeModeDecision = "run" | "ask" | "refuse";
+export type CodeModeDecision = "run" | "ask" | "refuse";
 
 // Under `auto`, Claude hands an ask-ruled call to the host rather than its classifier, and the
 // classifier would only see the code, never what it computes; so the user decides.

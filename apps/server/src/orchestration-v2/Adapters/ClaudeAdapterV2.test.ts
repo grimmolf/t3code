@@ -48,10 +48,12 @@ import {
   ProviderDriverKind,
   type ProviderReplayTranscript,
   type ProviderApprovalDecision,
+  type ProviderInteractionMode,
   ProviderSessionId,
   ProviderTurnId,
   RunAttemptId,
   RunId,
+  type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import { mcpAppFromToolItem } from "@t3tools/shared/toolOutput";
@@ -753,6 +755,64 @@ describe("ClaudeAdapterV2 MCP query overrides", () => {
     assert.deepEqual(
       [...ClaudeAdapterV2.CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS].sort(),
       readOnlyToolNames,
+    );
+  });
+
+  it("routes t3_code_run to canUseTool in every mode but full access", () => {
+    const threadId = ThreadId.make("thread-claude-code-mode");
+    const rows = [
+      { runtimeMode: "full-access", decision: "run" },
+      { runtimeMode: "full-access", bypassDisabled: true, decision: "ask" },
+      { runtimeMode: "auto", decision: "ask" },
+      { runtimeMode: "auto-accept-edits", decision: "ask" },
+      { runtimeMode: "approval-required", decision: "ask" },
+      { runtimeMode: "full-access", interactionMode: "plan", decision: "refuse" },
+      { runtimeMode: "full-access", readOnly: true, decision: "refuse" },
+    ] as const;
+    for (const row of rows) {
+      const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+        runtimeMode: row.runtimeMode,
+        interactionMode: "interactionMode" in row ? row.interactionMode : "default",
+        cwd: "/workspace",
+        ...("readOnly" in row
+          ? { sandboxPolicy: { type: "readOnly", access: { type: "fullAccess" } } }
+          : {}),
+      });
+      const queryPolicy = ClaudeAdapterV2.claudeRuntimeQueryPolicyForRuntimePolicy(runtimePolicy, {
+        bypassDisabled: "bypassDisabled" in row,
+        autoDisabled: false,
+      });
+      const decision = ClaudeAdapterV2.claudeCodeModeDecision(
+        runtimePolicy,
+        queryPolicy.permissionMode,
+      );
+      assert.equal(decision, row.decision, JSON.stringify(row));
+      const overrides = ClaudeAdapterV2.claudeMcpQueryOverrides({
+        mcpSession: mcpSessionFor(threadId),
+        readOnlySandbox: "readOnly" in row,
+        codeMode: decision,
+      });
+      assert.deepEqual(
+        overrides.askTools,
+        decision === "run" ? undefined : [ClaudeAdapterV2.CLAUDE_T3_CODE_RUN_TOOL],
+        JSON.stringify(row),
+      );
+    }
+
+    const options = ClaudeAdapterV2.makeClaudeQueryOptions({
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("claudeAgent"),
+        model: "claude-sonnet-4-6",
+      },
+      nativeThreadId: "native-thread-claude-code-mode",
+      resume: false,
+      cwd: null,
+      sdkSettings: { permissions: { ask: ["Bash(git push:*)"] } },
+      askTools: [ClaudeAdapterV2.CLAUDE_T3_CODE_RUN_TOOL],
+    });
+    assert.deepEqual(
+      typeof options.settings === "object" ? options.settings.permissions?.ask : undefined,
+      ["Bash(git push:*)", "mcp__t3-code__t3_code_run"],
     );
   });
 });
@@ -5663,6 +5723,103 @@ describe("ClaudeAdapterV2 background wake turns", () => {
           ),
         ),
       ),
+    );
+  });
+
+  describe("Code Mode approval", () => {
+    const script = { code: 'edit("src/a.ts", "old", "new");\nreturn 1;', title: "Rename old" };
+
+    it.effect.each([
+      // T3 adds no ask rule in full access; only a user's own rule reaches canUseTool there.
+      { runtimeMode: "full-access", interactionMode: "default", asks: true },
+      { runtimeMode: "auto", interactionMode: "default", asks: true },
+      { runtimeMode: "auto-accept-edits", interactionMode: "default", asks: true },
+      { runtimeMode: "approval-required", interactionMode: "default", asks: true },
+      { runtimeMode: "auto", interactionMode: "plan", asks: false },
+    ] as const satisfies ReadonlyArray<{
+      runtimeMode: RuntimeMode;
+      interactionMode: ProviderInteractionMode;
+      asks: boolean;
+    }>)(
+      "settles a script in $runtimeMode $interactionMode by the Code Mode table",
+      ({ runtimeMode, interactionMode, asks }) =>
+        Effect.gen(function* () {
+          const harness = yield* makeWakeHarnessWithOptions({
+            settings: { ...DEFAULT_CLAUDE_SETTINGS, codeMode: true },
+          });
+          const runtimePolicy = ProviderAdapter.ProviderAdapterV2RuntimePolicy.make({
+            runtimeMode,
+            interactionMode,
+            cwd: "/workspace",
+          });
+          const input = makeClaudeTestTurnInput({
+            threadId: harness.threadId,
+            providerThread: harness.providerThread,
+            now: yield* DateTime.now,
+            attemptId: RunAttemptId.make("attempt-claude-code-mode"),
+            text: "Rename old across src.",
+            attachments: [],
+            runtimePolicy,
+          });
+          yield* harness.runtime.startTurn({
+            ...input,
+            appThread: { ...input.appThread, runtimeMode, interactionMode },
+          });
+          const decision = yield* Effect.promise(() =>
+            harness.getOpenedOptions()!.canUseTool!(
+              ClaudeAdapterV2.CLAUDE_T3_CODE_RUN_TOOL,
+              script,
+              {
+                signal: new AbortController().signal,
+                toolUseID: "tool-code-run",
+                requestId: "request-code-run",
+              },
+            ),
+          ).pipe(Effect.forkScoped);
+          const first = yield* Effect.raceFirst(
+            Queue.take(harness.runtimeRequestReceipts).pipe(
+              Effect.map((event) => ({ type: "request", event }) as const),
+            ),
+            Fiber.join(decision).pipe(
+              Effect.map((result) => ({ type: "decision", result }) as const),
+            ),
+          );
+
+          if (!asks) {
+            assert.equal(first.type, "decision", "Plan mode asked about a script");
+            assert.equal(first.type === "decision" ? first.result?.behavior : undefined, "deny");
+            return;
+          }
+          assert.equal(first.type, "request", "the script ran without asking");
+          if (first.type !== "request") return;
+          yield* harness.runtime.respondToRuntimeRequest({
+            requestId: first.event.runtimeRequest.id,
+            decision: "accept",
+          });
+          const result = yield* Fiber.join(decision);
+          assert.equal(result?.behavior, "allow");
+          const card = harness.events.findLast(
+            (event) =>
+              event.type === "turn_item.updated" && event.turnItem.type === "approval_request",
+          );
+          assert.deepInclude(card?.type === "turn_item.updated" ? card.turnItem : undefined, {
+            prompt: script.code,
+            options: [
+              { decision: "decline", label: "Decline" },
+              { decision: "accept", label: "Approve" },
+            ],
+          });
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(
+              IdAllocator.layer,
+              McpProviderSessions.layer,
+              NodeServices.layer,
+              NodeCrypto.layer,
+            ),
+          ),
+        ),
     );
   });
 

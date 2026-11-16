@@ -10,7 +10,9 @@ import {
   dynamicToolTitle,
   formatReadToolLabel,
   formatSearchToolLabel,
+  T3_CODE_RUN_TOOL_NAME,
 } from "@t3tools/shared/toolActivity";
+import { type CodeModeDecision, codeModeDecision } from "../../codeMode/CodeModePolicy.ts";
 import { field, text } from "../unknownField.ts";
 import { mergeWorkflowAgentMetadata, type WorkflowAgentMetadata } from "../workflowAgentAnswers.ts";
 import {
@@ -963,6 +965,8 @@ function claudeRulesMayCoverMcpTools(
     return (
       behaviors.includes(entry.behavior) &&
       entry.notInEffect !== true &&
+      // Code Mode's ask rule names one T3 tool exactly; it must not cost app tools their hint.
+      !(entry.behavior === "ask" && entry.rule === CLAUDE_T3_CODE_RUN_TOOL) &&
       (name.startsWith("mcp__") || name.includes("*"))
     );
   });
@@ -2163,6 +2167,8 @@ export function makeClaudeQueryOptions(input: {
   readonly appendSystemPromptFileText?: string;
   // Flag settings, because a user's settings.json env beats the process env in Claude Code.
   readonly toolSearchOverride?: "true";
+  /** Ask rules, which reach canUseTool even where an allow rule or bypass would not. */
+  readonly askTools?: ReadonlyArray<string>;
 }): ClaudeAgentSdkQueryOptions {
   const compiledSelection = compileClaudeModelSelection(input.modelSelection, input.modelCatalog);
   const {
@@ -2246,6 +2252,16 @@ export function makeClaudeQueryOptions(input: {
               : { ENABLE_TOOL_SEARCH: input.toolSearchOverride }),
           },
         } as ClaudeSdkSettings);
+  const askQuerySettings =
+    input.askTools === undefined || typeof effectiveQuerySettings === "string"
+      ? effectiveQuerySettings
+      : ({
+          ...effectiveQuerySettings,
+          permissions: {
+            ...effectiveQuerySettings?.permissions,
+            ask: [...(effectiveQuerySettings?.permissions?.ask ?? []), ...input.askTools],
+          },
+        } as ClaudeSdkSettings);
   const deviceInstructions = input.mcpServers !== undefined && input.deviceToolsAvailable === true;
   const options: ClaudeAgentSdkQueryOptions = {
     model: compiledSelection.apiModelId,
@@ -2276,16 +2292,16 @@ export function makeClaudeQueryOptions(input: {
       ? {
           thinking: { type: "adaptive" as const, display: "summarized" as const },
           settings:
-            typeof effectiveQuerySettings === "string"
-              ? effectiveQuerySettings
+            typeof askQuerySettings === "string"
+              ? askQuerySettings
               : {
-                  ...effectiveQuerySettings,
+                  ...askQuerySettings,
                   showThinkingSummaries: true,
                 },
         }
-      : effectiveQuerySettings === undefined
+      : askQuerySettings === undefined
         ? {}
-        : { settings: effectiveQuerySettings }),
+        : { settings: askQuerySettings }),
     ...(input.onUserDialog === undefined ? {} : { onUserDialog: input.onUserDialog }),
     ...(input.onElicitation === undefined ? {} : { onElicitation: input.onElicitation }),
     ...(input.supportedDialogKinds === undefined
@@ -2416,6 +2432,7 @@ export const readClaudeLaunchArgSettings = Effect.fn("ClaudeAdapterV2.readLaunch
 );
 
 export const CLAUDE_T3_MCP_TOOL_WILDCARD = "mcp__t3-code__*";
+export const CLAUDE_T3_CODE_RUN_TOOL = `mcp__t3-code__${T3_CODE_RUN_TOOL_NAME}`;
 
 // Keep in sync with OrchestratorToolkit Tool.Readonly annotations; ClaudeAdapterV2.test.ts checks this.
 export const CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS: ReadonlyArray<string> = [
@@ -2448,9 +2465,12 @@ export function claudeMcpQueryOverrides(input: {
   readonly mcpSession: McpProviderSession.McpProviderSessionConfig | undefined;
   readonly readOnlySandbox: boolean;
   readonly allowedTools?: ReadonlyArray<string>;
+  /** The Code Mode decision for this query, when the instance offers Code Mode. */
+  readonly codeMode?: CodeModeDecision;
 }): {
   readonly allowedTools?: ReadonlyArray<string>;
   readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
+  readonly askTools?: ReadonlyArray<string>;
 } {
   const session = input.mcpSession;
   if (session === undefined) {
@@ -2460,6 +2480,10 @@ export function claudeMcpQueryOverrides(input: {
     ? CLAUDE_READ_ONLY_T3_MCP_ALLOWED_TOOLS
     : [CLAUDE_T3_MCP_TOOL_WILDCARD];
   return {
+    // Without its own ask rule the wildcard would pre-approve every script.
+    ...(input.codeMode === undefined || input.codeMode === "run"
+      ? {}
+      : { askTools: [CLAUDE_T3_CODE_RUN_TOOL] }),
     allowedTools: Array.from(new Set([...(input.allowedTools ?? []), ...mcpAllowedTools])),
     mcpServers: {
       "t3-code": {
@@ -3478,6 +3502,7 @@ export function claudeEffectiveQueryPolicyKey(
   mcpOverrides: {
     readonly allowedTools?: ReadonlyArray<string>;
     readonly mcpServers?: ClaudeQueryOptions["mcpServers"];
+    readonly askTools?: ReadonlyArray<string>;
   },
 ): string {
   return JSON.stringify({
@@ -3488,6 +3513,22 @@ export function claudeEffectiveQueryPolicyKey(
         : { allowedTools: mcpOverrides.allowedTools }),
     }),
     mcpServers: mcpOverrides.mcpServers,
+    askTools: mcpOverrides.askTools,
+  });
+}
+
+/** Code Mode's decision for a Claude query. Full access with bypass disabled runs as Auto. */
+export function claudeCodeModeDecision(
+  runtimePolicy: ProviderAdapter.ProviderAdapterV2RuntimePolicy,
+  permissionMode: PermissionMode,
+): CodeModeDecision {
+  return codeModeDecision({
+    runtimeMode:
+      runtimePolicy.runtimeMode === "full-access" && permissionMode !== "bypassPermissions"
+        ? "auto"
+        : runtimePolicy.runtimeMode,
+    interactionMode: permissionMode === "plan" ? "plan" : runtimePolicy.interactionMode,
+    readOnlySandbox: sandboxPolicyKindForClaudeRuntimePolicy(runtimePolicy) === "readOnly",
   });
 }
 
@@ -4013,7 +4054,7 @@ function webSearchResultsFromClaudeOutput(
 }
 
 function summarizeClaudeToolRequest(toolName: string, input: ClaudeNativeToolInput): string {
-  const command = firstStringInputField(input, ["command", "cmd", "script"]);
+  const command = firstStringInputField(input, ["command", "cmd", "script", "code"]);
   if (command !== undefined) {
     return `${toolName}: ${command.slice(0, 400)}`;
   }
@@ -12038,6 +12079,12 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           const nativeToolInput = claudeNativeToolInputFromRecord(toolInput);
           const heldForEcho = context.heldRootFrames.length > 0;
           const startToolCall = toolName !== "Agent" && options?.startToolCall !== false;
+          const activePermissionMode =
+            (yield* Ref.get(queryContext))?.permissionMode ?? context.queryPolicy.permissionMode;
+          const codeMode =
+            toolName === CLAUDE_T3_CODE_RUN_TOOL && adapterOptions.settings.codeMode
+              ? claudeCodeModeDecision(context.input.runtimePolicy, activePermissionMode)
+              : undefined;
           if (toolName === "Agent") {
             rememberClaudeSubagentLaunch(
               modelCatalog,
@@ -12060,7 +12107,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           if (
             heldForEcho &&
             toolName !== "ExitPlanMode" &&
-            (toolName === "AskUserQuestion" || requiresClaudeApproval(context))
+            (toolName === "AskUserQuestion" ||
+              codeMode === "ask" ||
+              requiresClaudeApproval(context))
           ) {
             // The SDK blocks prompt echoes on permission answers; release held output except for ExitPlanMode.
             yield* releaseHeldRootFrames(context);
@@ -12177,7 +12226,16 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             } satisfies PermissionResult;
           }
 
-          if (!requiresClaudeApproval(context)) {
+          if (codeMode === "refuse") {
+            return {
+              behavior: "deny",
+              message:
+                "t3_code_run cannot run in Plan mode or a read-only sandbox. Continue with your other tools, or ask the user to change the thread's mode.",
+              toolUseID: callbackOptions.toolUseID,
+            } satisfies PermissionResult;
+          }
+
+          if (codeMode !== "ask" && !requiresClaudeApproval(context)) {
             return {
               behavior: "allow",
               updatedInput: toolInput,
@@ -12185,8 +12243,6 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             } satisfies PermissionResult;
           }
 
-          const activePermissionMode =
-            (yield* Ref.get(queryContext))?.permissionMode ?? context.queryPolicy.permissionMode;
           const safetyReason = NodeUtil.stripVTControlCharacters(
             callbackOptions.decisionReason ?? "",
           ).trim();
@@ -12207,8 +12263,10 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
           }
 
           const requestKind = providerRequestKindFromClaudeTool(toolName);
-          // The user approves the command itself; Claude's title and description only summarize it.
-          const command = inputRecordValue(nativeToolInput, "command");
+          // The user approves the command or script itself; Claude's title and description only summarize it.
+          const command =
+            inputRecordValue(nativeToolInput, "command") ??
+            inputRecordValue(nativeToolInput, "code");
           const prompt =
             (typeof command === "string" && command.trim() !== "" ? command : undefined) ??
             callbackOptions.title ??
@@ -12221,11 +12279,15 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             nativeRequestId,
             requestKind,
             prompt,
-            presentation: claudeApprovalPresentation({
-              permissionMode: context.queryPolicy.permissionMode,
-              prompt,
-              callbackOptions,
-            }),
+            presentation: {
+              ...claudeApprovalPresentation({
+                permissionMode: context.queryPolicy.permissionMode,
+                prompt,
+                callbackOptions,
+              }),
+              // The ask rule outranks a session grant, so offering one would mislead.
+              ...(codeMode === undefined ? {} : { options: CLAUDE_NO_STANDING_GRANT_OPTIONS }),
+            },
           });
           const decision = yield* Deferred.make<ClaudeApprovalResponse, never>();
           yield* Ref.update(pendingRuntimeRequests, (current) => {
@@ -12590,6 +12652,14 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ...(queryPolicy.allowedTools === undefined
               ? {}
               : { allowedTools: queryPolicy.allowedTools }),
+            ...(adapterOptions.settings.codeMode
+              ? {
+                  codeMode: claudeCodeModeDecision(
+                    turnInput.runtimePolicy,
+                    queryPolicy.permissionMode,
+                  ),
+                }
+              : {}),
           });
           const queryPolicyKey = claudeEffectiveQueryPolicyKey(queryPolicy, mcpOverrides);
           const resumeSessionAt = yield* getNativeConversationHeadId(turnInput.providerThread);
@@ -12747,6 +12817,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             ...(mcpOverrides.mcpServers === undefined
               ? {}
               : { mcpServers: mcpOverrides.mcpServers }),
+            ...(mcpOverrides.askTools === undefined ? {} : { askTools: mcpOverrides.askTools }),
             deviceToolsAvailable: mcpSession?.capabilities?.has("device") === true,
             permissionMode: queryPolicy.permissionMode,
             ...(queryPolicy.allowDangerouslySkipPermissions === undefined

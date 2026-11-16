@@ -99,6 +99,11 @@ Claude receives an HTTP MCP server in its query options:
 The adapter logs only whether MCP configuration exists; it does not log the
 server headers or token.
 
+`t3_code_run` is listed and callable only for a thread whose provider instance
+sets `codeRun`, which only Claude does, with Code Mode on. Because the wildcard
+pre-approves it, the adapter adds an ask rule for it in every mode but full
+access, and `canUseTool` applies `codeMode/CodeModePolicy.ts`.
+
 ### Cursor Agent SDK V2
 
 Cursor receives the same authenticated HTTP MCP endpoint through the SDK's

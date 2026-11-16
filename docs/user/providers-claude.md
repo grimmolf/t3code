@@ -109,6 +109,28 @@ To show Claude task lists in the web and desktop apps, add
 **Environment** section in **Settings > Providers**. Each update shows as a Tasks
 row in the thread; open it to see every step.
 
+## Code Mode (experimental)
+
+Code Mode gives Claude a tool that runs one JavaScript program per call. One program can run
+several commands at once, repeat an edit across many files, or filter long output, and only what
+it returns goes back into the conversation.
+
+Turn on **Code Mode** in the Claude instance's settings in **Settings > Providers**. On mobile, use
+the switch under the account in **Settings > Providers**. Turning it off refuses the next script.
+
+| Permission mode                                 | Scripts                                  |
+| ----------------------------------------------- | ---------------------------------------- |
+| **Full access**                                 | Run without asking.                      |
+| **Auto**, **Auto-accept edits**, **Supervised** | Ask you first, showing the whole script. |
+| Plan mode                                       | Refused.                                 |
+
+Commands inside a script bypass Claude Code's permission system. Claude's Bash allow, ask, and
+deny rules and its hooks never see them, and neither does T3 Code's check for risky deletions.
+Turn Code Mode on only for instances you trust with that.
+
+A script runs in the thread's project folder or worktree, with the environment Claude's own
+commands get. It stops after 10 minutes.
+
 ## Claude in Chrome
 
 Claude threads can use the Claude in Chrome extension, which works in your own

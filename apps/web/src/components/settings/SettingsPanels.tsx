@@ -512,6 +512,7 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.snoozeLimitedThreads !== DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads
       ? ["Snooze until limits reset"]
       : []),
+    ...(settings.codeModeEnabled !== DEFAULT_UNIFIED_SETTINGS.codeModeEnabled ? ["Code Mode"] : []),
     ...(!Equal.equals(settings.snoozePresets, DEFAULT_UNIFIED_SETTINGS.snoozePresets)
       ? ["Snooze options"]
       : []),
@@ -682,6 +683,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
       autoResumeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.autoResumeLimitedThreads,
       snoozeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads,
+      codeModeEnabled: DEFAULT_UNIFIED_SETTINGS.codeModeEnabled,
       snoozePresets: DEFAULT_UNIFIED_SETTINGS.snoozePresets,
       responseStreamingMode: DEFAULT_UNIFIED_SETTINGS.responseStreamingMode,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
@@ -1880,6 +1882,25 @@ export function ThreadsSettingsPanel() {
           }
         />
       </SettingsSection>
+
+      {!isProjectScope ? (
+        <SettingsSection id="code-mode" title="Agent tools">
+          <SettingsRow
+            serverScoped
+            {...searchableSetting("code-mode")}
+            description="Agents run one JavaScript program per tool call and see only its result. Scripts get the thread's file and shell access, outside provider rules and hooks. Supervised and Auto-accept edits ask first."
+            settingKeys={["codeModeEnabled"]}
+            control={
+              <ScopedSwitch
+                settingKeys={["codeModeEnabled"]}
+                checked={settings.codeModeEnabled}
+                onCheckedChange={(checked) => updateSettings({ codeModeEnabled: Boolean(checked) })}
+                aria-label="Code Mode"
+              />
+            }
+          />
+        </SettingsSection>
+      ) : null}
 
       {hasServerTargets ? (
         <SettingsSection id="auto-settle" title="Auto-settle">

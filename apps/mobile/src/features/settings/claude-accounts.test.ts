@@ -6,7 +6,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { planClaudeAccountSave } from "./claude-accounts";
+import { planClaudeAccountSave, planClaudeCodeModeSave } from "./claude-accounts";
 
 const claude = ProviderDriverKind.make("claudeAgent");
 const work = ProviderInstanceId.make("claudeAgent_work");
@@ -111,6 +111,50 @@ describe("planClaudeAccountSave", () => {
         policy,
         instanceId: work,
         draft: { name: "Work", configDir: "~/.claude-other" },
+      }),
+    ).toEqual({ error: "Managed by Example Corp." });
+  });
+});
+
+describe("planClaudeCodeModeSave", () => {
+  it("switches Code Mode without dropping the instance's other settings", () => {
+    const providerInstances: ServerSettings["providerInstances"] = {
+      [work]: { driver: claude, displayName: "Work", config: { homePath: "~/.claude-work" } },
+    };
+    const save = (instanceId: ProviderInstanceId, codeMode: boolean) =>
+      planClaudeCodeModeSave({ providerInstances, policy: undefined, instanceId, codeMode });
+
+    expect(save(work, true)).toEqual({
+      mutation: {
+        operation: "upsert",
+        instanceId: work,
+        instance: {
+          driver: claude,
+          displayName: "Work",
+          config: { homePath: "~/.claude-work", codeMode: true },
+        },
+      },
+    });
+    expect(save(work, false)).toMatchObject({
+      mutation: { instance: { config: { homePath: "~/.claude-work", codeMode: false } } },
+    });
+    const defaultInstance = ProviderInstanceId.make("claudeAgent");
+    expect(save(defaultInstance, true)).toEqual({
+      mutation: {
+        operation: "upsert",
+        instanceId: defaultInstance,
+        instance: { driver: claude, config: { codeMode: true } },
+      },
+    });
+    expect(
+      planClaudeCodeModeSave({
+        providerInstances,
+        policy: {
+          organization: "Example Corp",
+          lockedSettings: ["providerInstances.claudeAgent_work"],
+        },
+        instanceId: work,
+        codeMode: true,
       }),
     ).toEqual({ error: "Managed by Example Corp." });
   });

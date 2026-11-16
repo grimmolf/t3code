@@ -3,6 +3,7 @@ import {
   deriveInstanceId,
 } from "@t3tools/client-runtime/provider-instance-ids";
 import {
+  ClaudeSettings,
   defaultInstanceIdForDriver,
   isManagedSettingPath,
   ProviderDriverKind,
@@ -12,6 +13,7 @@ import {
   type ProviderInstanceMutation,
   type ServerSettings,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 export const CLAUDE_DRIVER = ProviderDriverKind.make("claudeAgent");
 export const DEFAULT_CLAUDE_INSTANCE_ID = defaultInstanceIdForDriver(CLAUDE_DRIVER);
@@ -29,6 +31,36 @@ function configRecord(instance: ProviderInstanceConfig | undefined): Record<stri
 export function claudeConfigDir(instance: ProviderInstanceConfig | undefined): string {
   const homePath = configRecord(instance).homePath;
   return typeof homePath === "string" ? homePath : "";
+}
+
+const codeModeAnnotations = Schema.resolveAnnotationsKey(ClaudeSettings.fields.codeMode);
+export const CLAUDE_CODE_MODE_TITLE = String(codeModeAnnotations?.title ?? "Code Mode");
+export const CLAUDE_CODE_MODE_DESCRIPTION = String(codeModeAnnotations?.description ?? "");
+
+export function claudeCodeMode(instance: ProviderInstanceConfig | undefined): boolean {
+  return configRecord(instance).codeMode === true;
+}
+
+/** Turns Code Mode on or off for a Claude instance, keeping every other setting. */
+export function planClaudeCodeModeSave(input: {
+  readonly providerInstances: ServerSettings["providerInstances"];
+  readonly policy: ManagedPolicySummary | undefined;
+  readonly instanceId: ProviderInstanceId;
+  readonly codeMode: boolean;
+}): { readonly mutation: ProviderInstanceMutation } | { readonly error: string } {
+  if (input.policy && isManagedSettingPath(input.policy, `providerInstances.${input.instanceId}`)) {
+    return { error: `Managed by ${input.policy.organization}.` };
+  }
+  const current: ProviderInstanceConfig = Object.hasOwn(input.providerInstances, input.instanceId)
+    ? input.providerInstances[input.instanceId]!
+    : { driver: CLAUDE_DRIVER };
+  return {
+    mutation: {
+      operation: "upsert",
+      instanceId: input.instanceId,
+      instance: { ...current, config: { ...configRecord(current), codeMode: input.codeMode } },
+    },
+  };
 }
 
 /** Adds a Claude instance (`instanceId` null) or edits one, keeping every field the form doesn't show. */

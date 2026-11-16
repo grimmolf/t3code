@@ -663,6 +663,17 @@ it("rebuilds the template from this checkout and sends a child T3's task prompt"
   assert.notEqual(prompt?.text, childCase.prompt);
 });
 
+it("lists t3_code_run, loaded up front, only when a case turns Code Mode on", () => {
+  const listed = (codeMode: boolean) =>
+    buildBase(template, {
+      model: "claude-sonnet-5-5",
+      keepUserInstructions: false,
+      codeMode,
+    }).nativeTools.map((tool) => tool.name);
+  assert.notInclude(listed(false), "mcp__t3-code__t3_code_run");
+  assert.include(listed(true), "mcp__t3-code__t3_code_run");
+});
+
 it("lists link tools only while a case turns the beta on, and sends chips as T3 projects them", () => {
   const off = buildBase(template, { model: "claude-sonnet-5-5", keepUserInstructions: false });
   const on = buildBase(template, {

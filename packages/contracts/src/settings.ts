@@ -845,25 +845,9 @@ export const ClaudeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
-    codeMode: Schema.Boolean.pipe(
-      Schema.withDecodingDefault(Effect.succeed(false)),
-      Schema.annotateKey({
-        title: "Code Mode (experimental)",
-        description:
-          "Lets Claude run one JavaScript program per tool call to batch commands and edits. Scripts run outside Claude's Bash permission rules, its hooks, and T3 Code's removal guard.",
-        providerSettingsForm: { control: "switch" },
-      }),
-    ),
   },
   {
-    order: [
-      "binaryPath",
-      "homePath",
-      "autoCompactWindow",
-      "idleCompaction",
-      "codeMode",
-      "launchArgs",
-    ],
+    order: ["binaryPath", "homePath", "autoCompactWindow", "idleCompaction", "launchArgs"],
   },
 );
 export type ClaudeSettings = typeof ClaudeSettings.Type;
@@ -1443,6 +1427,8 @@ export const ServerSettings = Schema.Struct({
   defaultRuntimeMode: RuntimeMode.pipe(
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE)),
   ),
+  /** Experimental: offers every thread `t3_code_run`, which runs scripts outside provider command rules. */
+  codeModeEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
 
   projectSettingsOverrides: Schema.Record(
     ProjectId,
@@ -1888,6 +1874,7 @@ export const ServerSettingsPatch = Schema.Struct({
   ),
   defaultModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   defaultRuntimeMode: Schema.optionalKey(RuntimeMode),
+  codeModeEnabled: Schema.optionalKey(Schema.Boolean),
   fallbackModelSelection: Schema.optionalKey(Schema.NullOr(ModelSelection)),
   /** Replaces each project's override set; null removes it. Omitted providerInstances retains its stored value. */
   projectSettingsOverrides: Schema.optionalKey(

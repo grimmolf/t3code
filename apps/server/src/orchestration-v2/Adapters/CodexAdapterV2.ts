@@ -51,6 +51,7 @@ import {
   COMPUTER_USE_TOOL_SOURCE,
   dynamicToolSurface,
   dynamicToolTitle,
+  T3_CODE_RUN_TOOL_NAME,
 } from "@t3tools/shared/toolActivity";
 import { getModelSelectionStringOptionValue, modelSelectionsEqual } from "@t3tools/shared/model";
 import { appendGeneratedImageEmbeds } from "@t3tools/shared/generatedImageMarkdown";
@@ -1501,7 +1502,7 @@ const CODEX_T3_MCP_TOOL_TIMEOUT_SEC = 65 * 60;
 // Holds T3 tools Codex must call directly, never from Code Mode. Calls arrive as
 // `t3-code-direct.<tool>`; t3McpToolPresentation.ts must keep resolving that form.
 const CODEX_T3_DIRECT_MCP_SERVER = "t3-code-direct";
-const CODEX_DIRECT_ONLY_T3_TOOLS = ["t3_thread_wait", "delegate_task"];
+const CODEX_DIRECT_ONLY_T3_TOOLS = ["t3_thread_wait", "delegate_task", T3_CODE_RUN_TOOL_NAME];
 
 function codexThreadRuntimeParams(input: {
   readonly threadId: ThreadId | null;

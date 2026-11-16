@@ -11,9 +11,9 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const CodeRunTool = Tool.make(T3_CODE_RUN_TOOL_NAME, {
   description: [
-    "Run one JavaScript program in this thread's workspace; only what it returns comes back. Use it for a change repeated across many files, for search output to filter before you read it, or for independent commands to run together with Promise.all. For a single read or edit, use your Read or Edit tool instead.",
+    "Run one JavaScript program in this thread's workspace; only what it returns comes back. Use it for a change repeated across many files, for search output to filter before you read it, or for independent commands to run together with Promise.all. For a single read or edit, use your own file tools instead.",
     "`code` is the body of an async function. In scope: $`cmd` runs a shell command (/bin/sh; PowerShell on Windows), quotes each ${} value, and resolves to { stdout, stderr, exitCode }; it throws on a nonzero exit unless you add .nothrow(), and .text() gives stdout. edit(path, oldText, newText) replaces text that occurs exactly once, else throws. require and fs are Node's. Relative paths resolve against the workspace.",
-    "Prefer JavaScript string and file APIs to sed or perl one-liners, which differ between platforms. After a script changes a file, Read it again before you use Edit on it.",
+    "Prefer JavaScript string and file APIs to sed or perl one-liners, which differ between platforms. After a script changes a file, read it again before you edit it with another tool.",
     `\`return\` a JSON value. The response, with console output, is capped at ${RESPONSE_LIMIT_BYTES / 1024} KiB; \`truncated\` says when something was cut. A script stops after ${Duration.toMinutes(RUN_TIMEOUT)} minutes.`,
   ].join("\n\n"),
   parameters: Schema.Struct({

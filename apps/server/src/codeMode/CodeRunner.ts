@@ -37,7 +37,6 @@ export interface CodeRunInput {
   readonly code: string;
   /** Relative paths in the script resolve against it. */
   readonly cwd: string;
-  /** The environment the provider gives its own commands. */
   readonly environment: NodeJS.ProcessEnv;
 }
 

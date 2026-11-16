@@ -1,28 +1,17 @@
 import type { ProviderInteractionMode, RuntimeMode } from "@t3tools/contracts";
 
-/** What a `t3_code_run` call does in a thread: run unasked, ask the user first, or refuse. */
+/** What a `t3_code_run` call does in a thread: run, ask the user once per thread, or refuse. */
 export type CodeModeDecision = "run" | "ask" | "refuse";
 
-// Under `auto`, Claude hands an ask-ruled call to the host rather than its classifier, and the
-// classifier would only see the code, never what it computes; so the user decides.
 const DECISIONS = {
   "full-access": "run",
-  auto: "ask",
+  auto: "run",
   "auto-accept-edits": "ask",
   "approval-required": "ask",
   plan: "refuse",
-  "read-only": "refuse",
-} as const satisfies Record<RuntimeMode | "plan" | "read-only", CodeModeDecision>;
+} as const satisfies Record<RuntimeMode | "plan", CodeModeDecision>;
 
-export const codeModeDecision = (modes: {
+export const codeModeDecision = (thread: {
   readonly runtimeMode: RuntimeMode;
   readonly interactionMode: ProviderInteractionMode;
-  readonly readOnlySandbox?: boolean;
-}): CodeModeDecision =>
-  DECISIONS[
-    modes.readOnlySandbox === true
-      ? "read-only"
-      : modes.interactionMode === "plan"
-        ? "plan"
-        : modes.runtimeMode
-  ];
+}): CodeModeDecision => DECISIONS[thread.interactionMode === "plan" ? "plan" : thread.runtimeMode];

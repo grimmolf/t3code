@@ -1363,12 +1363,15 @@ const layerToolExposure = Layer.effect(
   McpToolExposure.McpToolExposure,
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
+    const codeMode = yield* CodeMode.CodeMode;
     return McpToolExposure.make(
-      () =>
-        server.tools
-          // Only Claude threads get the code tool, and Claude lists everything up front.
-          .filter(({ tool }) => tool.name !== T3_CODE_RUN_TOOL_NAME)
-          .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+      codeMode.offered.pipe(
+        Effect.map((codeRunOffered) =>
+          server.tools
+            .filter(({ tool }) => codeRunOffered || tool.name !== T3_CODE_RUN_TOOL_NAME)
+            .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+        ),
+      ),
       () => server.notifications["notifications/tools/list_changed"]({}),
     );
   }),
@@ -1402,7 +1405,7 @@ export const layerToolSearch = Layer.mergeAll(
   layerDeferredListing,
 ).pipe(Layer.provide(layerToolExposure));
 
-/** Hides `t3_code_run`, and refuses calls to it, unless the calling thread's instance offers it. */
+/** Hides `t3_code_run`, and refuses calls to it, unless Code Mode is on and a thread is calling. */
 const codeRunVisibility = McpServer.visibility(
   Effect.gen(function* () {
     const codeMode = yield* CodeMode.CodeMode;
@@ -1411,16 +1414,12 @@ const codeRunVisibility = McpServer.visibility(
       const scope = Option.getOrUndefined(
         yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
       );
-      return (
-        scope?.thread !== undefined &&
-        scope.client === undefined &&
-        (yield* codeMode.offered(scope.thread.providerInstanceId))
-      );
+      return scope?.thread !== undefined && scope.client === undefined && (yield* codeMode.offered);
     });
   }),
 );
 
-/** Outside layerTools: only Claude threads with Code Mode on list it. */
+/** Outside layerTools: only threads list it, and only while Code Mode is on. */
 export const layerCodeRunToolkit = toolkitRegistration(CodeRunToolkit, CodeRunHandlers.layer).pipe(
   Layer.provide(codeRunVisibility.layer),
 );

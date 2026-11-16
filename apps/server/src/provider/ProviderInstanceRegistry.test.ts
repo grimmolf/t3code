@@ -114,7 +114,6 @@ const makeClaudeConfig = (overrides: Partial<ClaudeSettings>): ClaudeSettings =>
   launchArgs: "",
   autoCompactWindow: "",
   idleCompaction: "default",
-  codeMode: false,
   ...overrides,
 });
 
@@ -474,36 +473,6 @@ describe("ProviderInstanceRegistry — multi-instance codex slice", () => {
         version: "2.1.219",
         auth: { status: "authenticated" },
       });
-    }).pipe(Effect.provide(layerTest)),
-  );
-
-  it.live("offers Code Mode only while the Claude instance has it on", () =>
-    Effect.gen(function* () {
-      if (yield* HostProcess.isWindows) return;
-
-      const fixtures = yield* makeTildeProviderFixtures();
-      const claudeId = ProviderInstanceId.make("claude_code_mode");
-      const entry = (codeMode: boolean) => ({
-        driver: ProviderDriverKind.make("claudeAgent"),
-        enabled: true,
-        config: makeClaudeConfig({
-          enabled: true,
-          binaryPath: fixtures.claudeBinaryPath,
-          homePath: fixtures.claudeHomePath,
-          codeMode,
-        }),
-      });
-      const { registry, mutator } = yield* makeProviderInstanceRegistry<ClaudeDriverEnv>({
-        drivers: [ClaudeDriver],
-        configMap: { [claudeId]: entry(true) },
-      });
-      expect((yield* registry.getInstance(claudeId))?.codeRun?.environment).toMatchObject({
-        CLAUDE_CODE_ENTRYPOINT: "t3-code",
-        CLAUDE_CONFIG_DIR: expect.any(String),
-      });
-
-      yield* mutator.reconcile({ [claudeId]: entry(false) });
-      expect((yield* registry.getInstance(claudeId))?.codeRun).toBeUndefined();
     }).pipe(Effect.provide(layerTest)),
   );
 

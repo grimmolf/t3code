@@ -14,12 +14,14 @@ const handlers = {
     McpInvocationContext.McpInvocationContext.pipe(
       Effect.flatMap((scope) => McpInvocationContext.requireThreadScope(scope, "t3_code_run")),
       Effect.flatMap(({ thread }) =>
-        Effect.flatMap(CodeMode.CodeMode, (codeMode) => codeMode.run(thread, code)),
+        Effect.flatMap(CodeMode.CodeMode, (codeMode) => codeMode.run(thread.threadId, code)),
       ),
       Effect.catchTags({
         CodeModeOffError: failure("capability_denied"),
         CodeModeRefusedError: failure("interaction_mode_escalation_denied"),
         CodeModeNoWorkspaceError: failure("thread_not_found"),
+        CodeModeAskError: failure("orchestration_error"),
+        CodeModeNotApprovedError: failure("capability_denied"),
         CodeRunStartError: failure("orchestration_error"),
       }),
     ),

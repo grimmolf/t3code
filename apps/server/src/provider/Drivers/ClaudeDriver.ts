@@ -58,7 +58,6 @@ import {
 import {
   makeClaudeCapabilitiesCacheKey,
   makeClaudeContinuationGroupKey,
-  makeClaudeEnvironment,
   mergeClaudeProcessEnvironment,
   resolveClaudeHomePath,
 } from "./ClaudeHome.ts";
@@ -408,20 +407,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
       ),
     );
 
-    // The same environment the adapter gives the commands Claude runs.
-    const codeRun = config.codeMode
-      ? {
-          environment: yield* makeClaudeEnvironment(
-            config,
-            yield* mergeClaudeProcessEnvironment(
-              config,
-              environment,
-              yield* HostProcess.Environment,
-            ),
-          ),
-        }
-      : undefined;
-
     return {
       instanceId,
       driverKind: DRIVER_KIND,
@@ -444,7 +429,6 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv, Path.
           Effect.provideService(Path.Path, path),
         ),
       orchestrationAdapter,
-      codeRun,
       textGeneration,
       consumeResetCredit,
     } satisfies ProviderInstance;

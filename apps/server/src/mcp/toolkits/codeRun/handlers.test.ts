@@ -8,7 +8,7 @@ import {
   type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
-import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
@@ -17,7 +17,7 @@ import * as CodeMode from "../../../codeMode/CodeMode.ts";
 import * as CodeRunner from "../../../codeMode/CodeRunner.ts";
 import * as ThreadManagement from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../../../project/ProjectService.ts";
-import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
+import * as ServerSettings from "../../../serverSettings.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { liveThreadShell } from "../../McpToolAccess.testkit.ts";
@@ -25,30 +25,17 @@ import * as CodeRunHandlers from "./handlers.ts";
 import { CodeRunToolkit } from "./tools.ts";
 
 const threadId = ThreadId.make("thread:code-run");
-const claudeOn = ProviderInstanceId.make("claudeAgent");
-const claudeOff = ProviderInstanceId.make("claude_work");
-const codex = ProviderInstanceId.make("codex");
-const environment = { PATH: "/usr/bin", ANTHROPIC_BASE_URL: "https://claude.example" };
+const environment = { PATH: "/usr/bin", HOME: "/home/user" };
 const ran = { result: 12, stdout: "", stderr: "", truncated: false, error: null };
 
 const call = Effect.fn("call")(function* (caller: {
-  readonly providerInstanceId?: ProviderInstanceId;
+  readonly codeModeEnabled?: boolean;
   readonly client?: boolean;
   readonly runtimeMode?: RuntimeMode;
   readonly interactionMode?: ProviderInteractionMode;
 }) {
   const runs: Array<CodeRunner.CodeRunInput> = [];
-  const providerInstanceId = caller.providerInstanceId ?? claudeOn;
-  const shell = {
-    ...liveThreadShell(threadId, caller),
-    projectId: ProjectId.make("project:acme"),
-    providerInstanceId,
-  };
-  const instances = new Map<ProviderInstanceId, Partial<ProviderInstance>>([
-    [claudeOn, { codeRun: { environment } }],
-    [claudeOff, {}],
-    [codex, {}],
-  ]);
+  const shell = { ...liveThreadShell(threadId, caller), projectId: ProjectId.make("project:acme") };
   const layerDependencies = Layer.mergeAll(
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
       environmentId: EnvironmentId.make("environment:code-run"),
@@ -56,7 +43,11 @@ const call = Effect.fn("call")(function* (caller: {
       thread:
         caller.client === true
           ? undefined
-          : { threadId, providerSessionId: "provider:code-run", providerInstanceId },
+          : {
+              threadId,
+              providerSessionId: "provider:code-run",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+            },
       client:
         caller.client === true
           ? { sessionId: "oauth:code-run", label: "Outside client", access: "full-access" }
@@ -72,9 +63,8 @@ const call = Effect.fn("call")(function* (caller: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
-        Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-          getInstance: (id) => Effect.succeed(instances.get(id) as ProviderInstance | undefined),
-        }),
+        ServerSettings.layerTest({ codeModeEnabled: caller.codeModeEnabled ?? true }),
+        Layer.succeed(HostProcess.Environment, environment),
         Layer.mock(ProjectService.ProjectService)({
           getById: () => Effect.succeedSome({ workspaceRoot: "/home/user/acme" } as Project),
         }),
@@ -101,11 +91,13 @@ const call = Effect.fn("call")(function* (caller: {
   return { result, runs };
 });
 
-it.effect("runs a Claude thread's script in its workspace with the instance's environment", () =>
+it.effect("runs a thread's script in its workspace with the server's environment", () =>
   Effect.gen(function* () {
-    const { result, runs } = yield* call({});
-    expect(result).toEqual(ran);
-    expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment }]);
+    for (const runtimeMode of ["full-access", "auto"] as const) {
+      const { result, runs } = yield* call({ runtimeMode });
+      expect(result).toEqual(ran);
+      expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment }]);
+    }
   }),
 );
 
@@ -113,8 +105,7 @@ it.effect("refuses every caller Code Mode is not for, before anything runs", () 
   Effect.gen(function* () {
     const refusals = [
       [{ client: true }, "thread_credential_required"],
-      [{ providerInstanceId: codex }, "capability_denied"],
-      [{ providerInstanceId: claudeOff }, "capability_denied"],
+      [{ codeModeEnabled: false }, "capability_denied"],
       [{ interactionMode: "plan" }, "interaction_mode_escalation_denied"],
     ] as const;
     for (const [caller, code] of refusals) {

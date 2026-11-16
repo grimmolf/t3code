@@ -1,35 +1,44 @@
 import {
-  ProviderInstanceId,
-  ProviderInteractionMode,
-  RuntimeMode,
+  CommandId,
+  type ProviderApprovalOption,
+  type RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
+import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
+import * as HostProcess from "@t3tools/shared/HostProcess";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
+import { t3OwnedRuntimeRequestId } from "../orchestration-v2/RuntimeRequestService.ts";
 import * as ThreadManagement from "../orchestration-v2/ThreadManagementService.ts";
 import * as ProjectService from "../project/ProjectService.ts";
-import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import { codeModeDecision } from "./CodeModePolicy.ts";
 import * as CodeRunner from "./CodeRunner.ts";
 
-export class CodeModeOffError extends Schema.TaggedError<CodeModeOffError>()("CodeModeOffError", {
-  providerInstanceId: ProviderInstanceId,
-}) {
+export class CodeModeOffError extends Schema.TaggedError<CodeModeOffError>()(
+  "CodeModeOffError",
+  {},
+) {
   override get message(): string {
-    return `Code Mode is off for provider instance ${this.providerInstanceId}. Only Claude instances offer it, in their provider settings.`;
+    return "Code Mode is off on this machine, so t3_code_run cannot run scripts. Use your other tools.";
   }
 }
 
 export class CodeModeRefusedError extends Schema.TaggedError<CodeModeRefusedError>()(
   "CodeModeRefusedError",
-  { runtimeMode: RuntimeMode, interactionMode: ProviderInteractionMode },
+  {},
 ) {
   override get message(): string {
-    return `Scripts cannot run while this thread is in ${this.interactionMode === "plan" ? "Plan mode" : `${this.runtimeMode} mode`}.`;
+    return "Scripts cannot run while this thread is in Plan mode. Continue with your other tools, or ask the user to leave Plan mode.";
   }
 }
 
@@ -42,66 +51,166 @@ export class CodeModeNoWorkspaceError extends Schema.TaggedError<CodeModeNoWorks
   }
 }
 
-interface CodeModeCaller {
-  readonly threadId: ThreadId;
-  readonly providerInstanceId: ProviderInstanceId;
+export class CodeModeAskError extends Schema.TaggedError<CodeModeAskError>()("CodeModeAskError", {
+  threadId: ThreadId,
+  cause: Schema.Defect(),
+}) {
+  override get message(): string {
+    return `Could not ask the user to approve the script in thread ${this.threadId}, so it did not run.`;
+  }
 }
+
+const ASK_TIMEOUT = Duration.minutes(60);
+
+export class CodeModeNotApprovedError extends Schema.TaggedError<CodeModeNotApprovedError>()(
+  "CodeModeNotApprovedError",
+  { outcome: Schema.Literals(["declined", "closed", "timed_out"]) },
+) {
+  override get message(): string {
+    switch (this.outcome) {
+      case "declined":
+        return "The user declined this script, so it did not run.";
+      case "closed":
+        return "The approval request closed before the user answered, so the script did not run.";
+      case "timed_out":
+        return `No one answered the approval request within ${Duration.toMinutes(ASK_TIMEOUT)} minutes, so the script did not run.`;
+    }
+  }
+}
+
+export const CODE_RUN_APPROVAL_OPTIONS: ReadonlyArray<ProviderApprovalOption> = [
+  { decision: "accept", label: "Approve" },
+  { decision: "acceptForSession", label: "Allow for this thread" },
+  { decision: "decline", label: "Decline" },
+];
+
+const CODE_RUN_REQUEST_PREFIX = t3OwnedRuntimeRequestId("code-run:");
 
 export class CodeMode extends Context.Service<
   CodeMode,
   {
-    /** Whether the caller's provider instance offers `t3_code_run`. */
-    readonly offered: (providerInstanceId: ProviderInstanceId) => Effect.Effect<boolean>;
+    /** Whether this environment offers `t3_code_run` to its threads. */
+    readonly offered: Effect.Effect<boolean>;
     readonly run: (
-      caller: CodeModeCaller,
+      threadId: ThreadId,
       code: string,
     ) => Effect.Effect<
       CodeRunner.CodeRunOutput,
       | CodeModeOffError
       | CodeModeRefusedError
       | CodeModeNoWorkspaceError
+      | CodeModeAskError
+      | CodeModeNotApprovedError
       | CodeRunner.CodeRunStartError
     >;
   }
 >()("t3/codeMode/CodeMode") {}
 
 const make = Effect.gen(function* () {
-  const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
+  const settings = yield* ServerSettings.ServerSettingsService;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const projects = yield* ProjectService.ProjectService;
   const runner = yield* CodeRunner.CodeRunner;
+  const environment = yield* HostProcess.Environment;
+  // One card at a time per thread, so "Allow for this thread" covers calls made in parallel.
+  const askLocks = yield* KeyedLock.make<ThreadId>();
 
   // Read per call, so turning the setting off refuses the next call.
-  const codeRunOf = (providerInstanceId: ProviderInstanceId) =>
-    registry.getInstance(providerInstanceId).pipe(Effect.map((instance) => instance?.codeRun));
+  const offered = settings.getSettings.pipe(
+    Effect.map((current) => current.codeModeEnabled),
+    Effect.orElseSucceed(() => false),
+  );
 
-  const offered = Effect.fn("CodeMode.offered")(function* (providerInstanceId: ProviderInstanceId) {
-    return (yield* codeRunOf(providerInstanceId)) !== undefined;
+  // The answered request is the grant, so "Allow for this thread" survives a restart.
+  const allowedForThread = (threadId: ThreadId) =>
+    threads
+      .getThreadRecords(threadId, ["runtimeRequests"], { runtimeRequestStatuses: ["resolved"] })
+      .pipe(
+        Effect.map((records) =>
+          records.runtimeRequests.some(
+            (request) =>
+              request.id.startsWith(CODE_RUN_REQUEST_PREFIX) &&
+              request.decision === "acceptForSession",
+          ),
+        ),
+        Effect.orElseSucceed(() => false),
+      );
+
+  const awaitAnswer = (threadId: ThreadId, requestId: RuntimeRequestId, afterSequence: number) =>
+    threads
+      .streamStoredEventsFrom({ threadId, afterSequence, eventType: "runtime-request.updated" })
+      .pipe(
+        Stream.filterMap((stored) =>
+          stored.event.type === "runtime-request.updated" &&
+          stored.event.payload.id === requestId &&
+          stored.event.payload.status !== "pending"
+            ? Result.succeed(stored.event.payload)
+            : Result.failVoid,
+        ),
+        Stream.runHead,
+      );
+
+  const ask = Effect.fn("CodeMode.ask")(function* (threadId: ThreadId, code: string) {
+    if (yield* allowedForThread(threadId)) return;
+    const requestId = t3OwnedRuntimeRequestId(`code-run:${yield* randomUuidV4}`);
+    const askError = (cause: unknown) => new CodeModeAskError({ threadId, cause });
+    const opened = yield* threads
+      .dispatch({
+        type: "runtime-request.open",
+        commandId: CommandId.make(`command:${requestId}:open`),
+        threadId,
+        requestId,
+        requestKind: "command",
+        prompt: code,
+        options: CODE_RUN_APPROVAL_OPTIONS,
+      })
+      .pipe(Effect.mapError(askError));
+    // A pending card must not outlive this call: a timeout, a failed wait or a cancelled call closes it.
+    const close = threads
+      .dispatch({
+        type: "runtime-request.respond",
+        commandId: CommandId.make(`command:${requestId}:close`),
+        threadId,
+        requestId,
+        decision: "cancel",
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("Could not close a Code Mode approval request", {
+            error: error.message,
+          }),
+        ),
+      );
+    const answer = yield* awaitAnswer(threadId, requestId, opened.sequence).pipe(
+      Effect.timeoutOption(ASK_TIMEOUT),
+      Effect.map(Option.flatten),
+      Effect.onExit((exit) =>
+        Exit.isSuccess(exit) && Option.isSome(exit.value) ? Effect.void : close,
+      ),
+      Effect.mapError(askError),
+    );
+    if (Option.isNone(answer)) return yield* new CodeModeNotApprovedError({ outcome: "timed_out" });
+    const { status, decision } = answer.value;
+    if (status === "resolved" && (decision === "accept" || decision === "acceptForSession")) return;
+    return yield* new CodeModeNotApprovedError({
+      outcome: status === "resolved" && decision === "decline" ? "declined" : "closed",
+    });
   });
 
-  const run = Effect.fn("CodeMode.run")(function* (caller: CodeModeCaller, code: string) {
-    const codeRun = yield* codeRunOf(caller.providerInstanceId);
-    if (codeRun === undefined) {
-      return yield* new CodeModeOffError({ providerInstanceId: caller.providerInstanceId });
-    }
-    const shell = yield* threads
-      .getThreadShell(caller.threadId)
-      .pipe(Effect.orElseSucceed(() => null));
-    if (shell === null) return yield* new CodeModeNoWorkspaceError({ threadId: caller.threadId });
-    if (codeModeDecision(shell) === "refuse") {
-      return yield* new CodeModeRefusedError({
-        runtimeMode: shell.runtimeMode,
-        interactionMode: shell.interactionMode,
-      });
-    }
+  const run = Effect.fn("CodeMode.run")(function* (threadId: ThreadId, code: string) {
+    if (!(yield* offered)) return yield* new CodeModeOffError();
+    const shell = yield* threads.getThreadShell(threadId).pipe(Effect.orElseSucceed(() => null));
+    if (shell === null) return yield* new CodeModeNoWorkspaceError({ threadId });
+    const decision = codeModeDecision(shell);
+    if (decision === "refuse") return yield* new CodeModeRefusedError();
     const cwd =
       shell.worktreePath ??
       Option.getOrUndefined(
         yield* projects.getById(shell.projectId).pipe(Effect.orElseSucceed(() => Option.none())),
       )?.workspaceRoot;
-    if (cwd === undefined)
-      return yield* new CodeModeNoWorkspaceError({ threadId: caller.threadId });
-    return yield* runner.run({ code, cwd, environment: codeRun.environment });
+    if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
+    if (decision === "ask") yield* askLocks.withLock(threadId, ask(threadId, code));
+    return yield* runner.run({ code, cwd, environment });
   });
 
   return CodeMode.of({ offered, run });

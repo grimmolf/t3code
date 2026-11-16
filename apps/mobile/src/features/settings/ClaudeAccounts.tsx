@@ -16,18 +16,13 @@ import * as Dialog from "../../components/ui/Dialog";
 import { AppText as Text } from "../../components/ui/AppText";
 import { ControlPill } from "../../components/ui/ControlPill";
 import { ListActionRow } from "../../components/ui/ListActionRow";
-import { ListToggleRow } from "../../components/ui/ListToggleRow";
 import { Menu } from "../../components/ui/Menu";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
 import {
-  CLAUDE_CODE_MODE_DESCRIPTION,
-  CLAUDE_CODE_MODE_TITLE,
-  claudeCodeMode,
   claudeConfigDir,
   DEFAULT_CLAUDE_INSTANCE_ID,
   planClaudeAccountSave,
-  planClaudeCodeModeSave,
   type ClaudeAccountDraft,
 } from "./claude-accounts";
 import type { SettingsTarget } from "./settings-environment-filter";
@@ -69,7 +64,7 @@ export function ClaudeAccount({
   readonly provider: ServerProvider;
 }) {
   const [editing, setEditing] = useState(false);
-  const { run, pending, error, setError } = useProviderInstanceMutation(environment);
+  const { run, pending, error } = useProviderInstanceMutation(environment);
   const instance = environment.serverConfig.settings.providerInstances[provider.instanceId];
   const configDir = claudeConfigDir(instance);
   const name = provider.displayName ?? "Claude";
@@ -101,16 +96,6 @@ export function ClaudeAccount({
         ]
       : []),
   ];
-  function setCodeMode(codeMode: boolean) {
-    const plan = planClaudeCodeModeSave({
-      providerInstances: environment.serverConfig.settings.providerInstances,
-      policy: environment.serverConfig.managedPolicy,
-      instanceId: provider.instanceId,
-      codeMode,
-    });
-    if ("error" in plan) setError(plan.error);
-    else void run(plan.mutation);
-  }
   function remove() {
     Dialog.alert(
       `Remove ${name}?`,
@@ -166,16 +151,7 @@ export function ClaudeAccount({
           initial={{ name: instance?.displayName ?? "", configDir }}
           onDone={() => setEditing(false)}
         />
-      ) : (
-        <ListToggleRow
-          label={CLAUDE_CODE_MODE_TITLE}
-          description={CLAUDE_CODE_MODE_DESCRIPTION}
-          value={claudeCodeMode(instance)}
-          disabled={pending}
-          onValueChange={setCodeMode}
-        />
-      )}
-      {editing ? null : error ? (
+      ) : error ? (
         <Text accessibilityRole="alert" className="px-4 pb-3 text-danger-foreground">
           {error}
         </Text>

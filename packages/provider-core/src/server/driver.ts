@@ -62,8 +62,6 @@ export interface ProviderInstance {
     creditId: string | undefined,
   ) => Effect.Effect<ProviderConsumeResetCreditOutcome, ProviderDriverError>;
   readonly orchestrationAdapter: ProviderAdapter.ProviderAdapterV2["Service"];
-  /** Set when this instance's threads may call `t3_code_run`: the environment its scripts get. */
-  readonly codeRun?: { readonly environment: NodeJS.ProcessEnv } | undefined;
   readonly textGeneration: ProviderTextGeneration;
   readonly auth?: ProviderAuthController;
   readonly acpSessionManagement?: {

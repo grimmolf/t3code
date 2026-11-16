@@ -53,7 +53,11 @@ describe("toolActivity", () => {
   });
 
   it("presents T3's code tool as a JavaScript run under the names providers report", () => {
-    for (const name of ["mcp__t3-code__t3_code_run", "t3-code.t3_code_run"]) {
+    for (const name of [
+      "mcp__t3-code__t3_code_run",
+      "t3-code.t3_code_run",
+      "t3-code-direct.t3_code_run",
+    ]) {
       expect(isJavaScriptReplTool(name)).toBe(true);
       expect(dynamicToolTitle(name, { code: "return 1", title: "Rename helpers" })).toBe(
         "Rename helpers",

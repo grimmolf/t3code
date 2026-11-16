@@ -1,0 +1,2 @@
+2026-11-16T08:28:49.261Z [WARN] CLAUDE_CODE_ENTRYPOINT in settings is ignored: no settings file can give it this value, only the environment Claude Code is started with or Claude Code itself.
+2026-11-16T08:28:49.481Z [DEBUG] attribution header x-anthropic-billing-header: cc_version=2.1.325.382; cc_entrypoint=sdk-ts; cc_turn_origin=sdk; cc_prompt_index=0; cc_turn_index=1;

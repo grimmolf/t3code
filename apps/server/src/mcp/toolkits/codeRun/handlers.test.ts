@@ -3,9 +3,7 @@ import {
   EnvironmentId,
   type Project,
   ProjectId,
-  type ProviderInteractionMode,
   ProviderInstanceId,
-  type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -32,8 +30,7 @@ const ran = { result: 12, stdout: "", stderr: "", truncated: false, error: null 
 const call = Effect.fn("call")(function* (caller: {
   readonly codeModeEnabled?: boolean;
   readonly client?: boolean;
-  readonly runtimeMode?: RuntimeMode;
-  readonly interactionMode?: ProviderInteractionMode;
+  readonly platform?: NodeJS.Platform;
 }) {
   const runs: Array<CodeRunner.CodeRunInput> = [];
   const shell = { ...liveThreadShell(threadId, caller), projectId: ProjectId.make("project:acme") };
@@ -66,6 +63,7 @@ const call = Effect.fn("call")(function* (caller: {
         layerDependencies,
         ServerSettings.layerTest({ codeModeEnabled: caller.codeModeEnabled ?? true }),
         Layer.succeed(HostProcess.Environment, environment),
+        Layer.succeed(HostProcess.Platform, caller.platform ?? "linux"),
         Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
           getInstance: () => Effect.undefined,
         }),
@@ -97,11 +95,9 @@ const call = Effect.fn("call")(function* (caller: {
 
 it.effect("runs a thread's script in its workspace with the server's environment", () =>
   Effect.gen(function* () {
-    for (const runtimeMode of ["full-access", "auto"] as const) {
-      const { result, runs } = yield* call({ runtimeMode });
-      expect(result).toEqual(ran);
-      expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment }]);
-    }
+    const { result, runs } = yield* call({});
+    expect(result).toEqual(ran);
+    expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment }]);
   }),
 );
 
@@ -110,7 +106,7 @@ it.effect("refuses every caller Code Mode is not for, before anything runs", () 
     const refusals = [
       [{ client: true }, "thread_credential_required"],
       [{ codeModeEnabled: false }, "capability_denied"],
-      [{ interactionMode: "plan" }, "interaction_mode_escalation_denied"],
+      [{ platform: "win32" }, "capability_denied"],
     ] as const;
     for (const [caller, code] of refusals) {
       const { result, runs } = yield* call(caller);

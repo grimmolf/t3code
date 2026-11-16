@@ -131,6 +131,15 @@ const fitResponse = (input: {
 
 const empty: Collected = { text: "", truncated: false };
 
+// The same prefixes the terminal keeps from shells, plus the MCP credentials.
+const isServerOnlyVariable = (name: string) => {
+  const upper = name.toUpperCase();
+  return (
+    upper === "ELECTRON_RUN_AS_NODE" ||
+    ["T3_MCP_", "T3CODE_", "VITE_"].some((prefix) => upper.startsWith(prefix))
+  );
+};
+
 const make = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const executablePath = yield* HostProcess.ExecutablePath;
@@ -144,7 +153,7 @@ const make = Effect.gen(function* () {
   const run = Effect.fn("CodeRunner.run")(function* (input: CodeRunInput) {
     const environment: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: "1" };
     for (const [name, value] of Object.entries(input.environment)) {
-      if (!name.startsWith("T3_MCP_") && name !== "ELECTRON_RUN_AS_NODE") environment[name] = value;
+      if (!isServerOnlyVariable(name)) environment[name] = value;
     }
     return yield* Effect.scoped(
       Effect.gen(function* () {

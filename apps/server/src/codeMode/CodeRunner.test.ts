@@ -122,20 +122,22 @@ it.layer(layerTest)("CodeRunner", (it) => {
       }),
     );
 
-    it.effect("gives shell children the provider's environment without T3 credentials", () =>
+    it.effect("gives shell children T3's environment without its credentials or settings", () =>
       Effect.gen(function* () {
         const output = yield* run(
-          `return $\`printf '%s|%s|%s' "$ELECTRON_RUN_AS_NODE" "$T3_MCP_BEARER_TOKEN" "$KEEP"\`.text();`,
+          `return $\`printf '%s|%s|%s|%s|%s' "$ELECTRON_RUN_AS_NODE" "$T3_MCP_BEARER_TOKEN" "$T3CODE_DEV_AUTH_TOKEN" "$VITE_WS_URL" "$KEEP"\`.text();`,
           {
             environment: {
               PATH: (yield* HostProcess.Environment).PATH,
               ELECTRON_RUN_AS_NODE: "1",
               T3_MCP_BEARER_TOKEN: "secret",
+              T3CODE_DEV_AUTH_TOKEN: "secret",
+              VITE_WS_URL: "ws://localhost",
               KEEP: "kept",
             },
           },
         );
-        expect(output).toMatchObject({ result: "||kept", error: null });
+        expect(output).toMatchObject({ result: "||||kept", error: null });
       }),
     );
   });

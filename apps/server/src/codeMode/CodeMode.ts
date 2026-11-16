@@ -116,14 +116,18 @@ const make = Effect.gen(function* () {
   const providerInstances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
   const runner = yield* CodeRunner.CodeRunner;
   const environment = yield* HostProcess.Environment;
+  const platform = yield* HostProcess.Platform;
   // One card at a time per thread, so "Allow for this thread" covers calls made in parallel.
   const askLocks = yield* KeyedLock.make<ThreadId>();
 
   // Read per call, so turning the setting off refuses the next call.
-  const offered = settings.getSettings.pipe(
-    Effect.map((current) => current.codeModeEnabled),
-    Effect.orElseSucceed(() => false),
-  );
+  const offered =
+    platform === "win32"
+      ? Effect.succeed(false)
+      : settings.getSettings.pipe(
+          Effect.map((current) => current.codeModeEnabled),
+          Effect.orElseSucceed(() => false),
+        );
 
   // The answered request is the grant, so "Allow for this thread" survives a restart.
   const allowedForThread = (threadId: ThreadId) =>

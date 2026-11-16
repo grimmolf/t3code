@@ -10,18 +10,11 @@ const os = require("node:os");
 const path = require("node:path");
 const childProcess = require("node:child_process");
 const { createRequire } = require("node:module");
-const windows = process.platform === "win32";
 
 const quote = (value) => {
   if (Array.isArray(value)) return value.map(quote).join(" ");
-  const text = String(value);
-  return windows ? "'" + text.replace(/'/g, "''") + "'" : "'" + text.replace(/'/g, "'\\''") + "'";
+  return "'" + String(value).replace(/'/g, "'\\''") + "'";
 };
-
-const shellCommand = (command) =>
-  windows
-    ? ["powershell.exe", ["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(command, "utf16le").toString("base64")]]
-    : ["/bin/sh", ["-c", command]];
 
 class ShellError extends Error {
   constructor(command, result) {
@@ -43,8 +36,7 @@ const $ = (strings, ...values) => {
     "",
   );
   const finished = new Promise((resolve) => {
-    const [file, args] = shellCommand(command);
-    const child = childProcess.spawn(file, args, { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const child = childProcess.spawn("/bin/sh", ["-c", command], { stdio: ["ignore", "pipe", "pipe"] });
     const stdout = [];
     const stderr = [];
     child.stdout.on("data", (chunk) => stdout.push(chunk));

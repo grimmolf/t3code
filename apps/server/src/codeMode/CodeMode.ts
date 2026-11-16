@@ -241,19 +241,44 @@ const make = Effect.gen(function* () {
   });
 
   const run = Effect.fn("CodeMode.run")(function* (threadId: ThreadId, code: string) {
-    const { shell, runId, decision } = yield* permit(threadId);
-    const cwd =
-      shell.worktreePath ??
-      Option.getOrUndefined(
-        yield* projects.getById(shell.projectId).pipe(Effect.orElseSucceed(() => Option.none())),
-      )?.workspaceRoot;
-    if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
-    if (decision === "ask") yield* askLocks.withLock(threadId, ask(threadId, code));
-    // The card can outlast the setting, the thread's mode, and the turn that called.
-    if ((yield* permit(threadId)).runId !== runId) {
-      return yield* new CodeModeTurnEndedError({ threadId });
+    const { runId } = yield* permit(threadId);
+    // The setting, the thread's mode and the turn can all change while a call waits.
+    const current = permit(threadId).pipe(
+      Effect.filterOrFail(
+        (permitted) => permitted.runId === runId,
+        () => new CodeModeTurnEndedError({ threadId }),
+      ),
+    );
+    let approved = false;
+    while (true) {
+      const { shell, decision } = yield* current;
+      if (decision === "run" || approved) {
+        const cwd =
+          shell.worktreePath ??
+          Option.getOrUndefined(
+            yield* projects
+              .getById(shell.projectId)
+              .pipe(Effect.orElseSucceed(() => Option.none())),
+          )?.workspaceRoot;
+        if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
+        return yield* runner.run({ code, cwd, environment });
+      }
+      // One deadline covers queueing behind another call's card and waiting for this one.
+      const asked = yield* askLocks
+        .withLock(
+          threadId,
+          Effect.gen(function* () {
+            if ((yield* current).decision !== "ask") return false;
+            yield* ask(threadId, code);
+            return true;
+          }),
+        )
+        .pipe(Effect.timeoutOption(ASK_TIMEOUT));
+      if (Option.isNone(asked)) {
+        return yield* new CodeModeNotApprovedError({ outcome: "timed_out" });
+      }
+      approved = asked.value;
     }
-    return yield* runner.run({ code, cwd, environment });
   });
 
   return CodeMode.of({ offered, run });

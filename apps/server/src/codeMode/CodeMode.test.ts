@@ -342,6 +342,26 @@ const startAsking = Effect.fn("startAsking")(function* (
   return { script, requestId };
 });
 
+/** The next approval card opened in the thread after `afterSequence`. */
+const pendingCardAfter = Effect.fn("pendingCardAfter")(function* (
+  threadId: ThreadId,
+  afterSequence: number,
+) {
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const pending = yield* threads
+    .streamStoredEventsFrom({ threadId, afterSequence, eventType: "runtime-request.updated" })
+    .pipe(
+      Stream.filter(
+        (stored) =>
+          stored.event.type === "runtime-request.updated" &&
+          stored.event.payload.status === "pending",
+      ),
+      Stream.runHead,
+    );
+  assert.ok(Option.isSome(pending) && pending.value.event.type === "runtime-request.updated");
+  return pending.value.event.payload.id as RuntimeRequestId;
+});
+
 const respond = (
   threadId: ThreadId,
   requestId: RuntimeRequestId,
@@ -422,6 +442,32 @@ it.effect("asks for each script until the user allows the thread", () =>
       ),
     ),
   ),
+);
+
+it.effect("queues a second script behind the first card, then asks for it", () =>
+  withCodeMode((codeMode, runs) =>
+    Effect.gen(function* () {
+      const threads = yield* ThreadManagementService.ThreadManagementService;
+      const cards = (threadId: ThreadId) =>
+        threads
+          .getThreadRecords(threadId, ["runtimeRequests"])
+          .pipe(Effect.map(({ runtimeRequests }) => runtimeRequests.length));
+
+      const answered = yield* startTurn("queued-answered");
+      const first = yield* startAsking(codeMode, answered.threadId, "return 'first'");
+      const queued = yield* codeMode
+        .run(answered.threadId, "return 'second'")
+        .pipe(Effect.exit, Effect.forkChild);
+      const beforeAnswer = yield* threads.getThreadEventSequence(answered.threadId);
+      yield* respond(answered.threadId, first.requestId, "accept");
+      yield* Fiber.join(first.script);
+      const second = yield* pendingCardAfter(answered.threadId, beforeAnswer);
+      assert.equal(yield* cards(answered.threadId), 2);
+      yield* respond(answered.threadId, second, "accept");
+      assert.ok(Exit.isSuccess(yield* Fiber.join(queued)));
+      assert.deepEqual(runs, ["return 'first'", "return 'second'"]);
+    }),
+  ).pipe(Effect.provide(layerTest)),
 );
 
 it.effect("asks where the running turn's provider may not run the thread's mode", () =>

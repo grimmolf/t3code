@@ -18,6 +18,7 @@ import { projectComposerContextForProvider } from "@t3tools/shared/composerConte
 import {
   answerToolCall,
   buildBase,
+  buildCodexBase,
   buildMessages,
   failedEarly,
   executeCodex,
@@ -50,6 +51,7 @@ it("grades Codex shell and subagent calls with the shared rules", () => {
     { name: "exec_command", input: { cmd: "sleep 60" } },
     { name: "collaboration.spawn_agent", input: { task: "review" } },
     { name: "mcp__t3_code__delegate_task", input: {} },
+    { name: "mcp__t3_code_direct__t3_code_run", input: { code: "return 1" } },
     { name: "request_user_input", input: { questions: [{ question: "What's the PIN?" }] } },
     { name: "request_user_input_async", input: { questions: [] } },
   ].map(({ name, input }) => ({
@@ -59,7 +61,7 @@ it("grades Codex shell and subagent calls with the shared rules", () => {
   }));
   assert.deepEqual(
     calls.map((c) => c.tool),
-    ["Bash", "Agent", "delegate_task", "AskUserQuestion", "AskUserQuestion"],
+    ["Bash", "Agent", "delegate_task", "t3_code_run", "AskUserQuestion", "AskUserQuestion"],
   );
   // Codex's question tools are graded as AskUserQuestion, so secret asks in them count.
   assert.deepEqual(
@@ -663,7 +665,7 @@ it("rebuilds the template from this checkout and sends a child T3's task prompt"
   assert.notEqual(prompt?.text, childCase.prompt);
 });
 
-it("lists t3_code_run, loaded up front, only when a case turns Code Mode on", () => {
+it("lists t3_code_run only when a case turns Code Mode on, and to Codex only directly", () => {
   const listed = (codeMode: boolean) =>
     buildBase(template, {
       model: "claude-sonnet-5-5",
@@ -672,6 +674,36 @@ it("lists t3_code_run, loaded up front, only when a case turns Code Mode on", ()
     }).nativeTools.map((tool) => tool.name);
   assert.notInclude(listed(false), "mcp__t3-code__t3_code_run");
   assert.include(listed(true), "mcp__t3-code__t3_code_run");
+
+  const codex = (codeMode: boolean) =>
+    buildCodexBase(
+      {
+        reasoning: { effort: "high" },
+        input: [
+          {
+            type: "message",
+            role: "developer",
+            content: [{ type: "input_text", text: "<t3_code_runtime>old</t3_code_runtime>" }],
+          },
+          {
+            type: "additional_tools",
+            role: "developer",
+            tools: [
+              { type: "namespace", name: "functions", tools: [{ type: "custom", name: "exec" }] },
+            ],
+          },
+        ],
+      },
+      { model: "gpt-6.1-sol", keepUserInstructions: false, codeMode },
+    );
+  const direct = (codeMode: boolean) => codex(codeMode).nativeTools.map((tool) => tool.name);
+  assert.notInclude(direct(false), "mcp__t3_code_direct__t3_code_run");
+  assert.include(direct(true), "mcp__t3_code_direct__t3_code_run");
+  assert.notInclude(
+    codex(true).t3.map((tool) => tool.name),
+    "mcp__t3-code__t3_code_run",
+    "a code cell must not reach t3_code_run",
+  );
 });
 
 it("lists link tools only while a case turns the beta on, and sends chips as T3 projects them", () => {

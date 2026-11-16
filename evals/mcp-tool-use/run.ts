@@ -119,6 +119,9 @@ const PROXY_SHELL_MODELS = ["gpt-6-luna", "gpt-6.1-terra"] as const;
 type ShellModel = PricedModel | (typeof PROXY_SHELL_MODELS)[number];
 const isPricedModel = (model: ShellModel): model is PricedModel => model in PRICES;
 const T3_PREFIX = "mcp__t3-code__";
+// Codex reaches tools on T3's direct-only server as plain functions, never from a code cell.
+const CODEX_DIRECT_PREFIX = "mcp__t3_code_direct__";
+const T3_NAME = /^mcp__t3[-_]code(?:_direct)?__/u;
 const RUNTIME_MARKER = "<runtime_info>";
 const TOOL_LOADED = "Tool loaded.";
 
@@ -415,7 +418,7 @@ const toolResult = (id: string, content: unknown): Block => ({
 });
 const texts = (content: typeof Content.Type) =>
   typeof content === "string" ? [content] : content.flatMap((block) => block.text ?? []);
-const isT3Name = (name: string) => name.startsWith(T3_PREFIX) || name.startsWith("mcp__t3_code__");
+const isT3Name = (name: string) => T3_NAME.test(name);
 const hasTool = (tools: ReadonlyArray<ApiTool>, name: string) =>
   tools.some((tool) => tool.name === name);
 
@@ -434,7 +437,7 @@ const CODEX_NAMES: Readonly<Record<string, string>> = {
 export const normalizeToolName = (name: string) => {
   const bare = name.slice(name.lastIndexOf(".") + 1);
   return isT3Name(bare)
-    ? bare.slice(T3_PREFIX.length)
+    ? bare.replace(T3_NAME, "")
     : (CODEX_NAMES[bare] ?? bare.slice(bare.lastIndexOf("_") + 1));
 };
 export const normalizeToolInput = (name: string, input: unknown) => {
@@ -731,7 +734,7 @@ type Base = ReturnType<typeof buildBase> & {
 };
 
 /** Keep the captured harness prompt and tools; replace app-owned context and the real user. */
-const buildCodexBase = (
+export const buildCodexBase = (
   template: typeof ResponsesRequest.Type,
   options: {
     readonly model: Model;
@@ -746,7 +749,18 @@ const buildCodexBase = (
     readonly browserAccess?: boolean;
   },
 ): Base => {
-  const t3 = visibleT3Tools(options);
+  const visible = visibleT3Tools(options);
+  // T3 registers Code Mode's tool on Codex's direct-only server, as CodexAdapterV2 does.
+  const t3 = visible.filter((tool) => !codeModeTools.has(tool.name));
+  const directTools = visible
+    .filter((tool) => codeModeTools.has(tool.name))
+    .map((tool) => ({
+      type: "function",
+      name: tool.name.replace(T3_PREFIX, CODEX_DIRECT_PREFIX),
+      description: tool.description,
+      parameters: tool.input_schema,
+      strict: false,
+    }));
   const contentText = (item: Block) =>
     Array.isArray(item.content)
       ? item.content.map((block: Block) => valueText(block.text)).join("\n")
@@ -775,7 +789,18 @@ const buildCodexBase = (
     // every case.
     if (item.type !== "message" && item.type !== "additional_tools") return [];
     if (item.role === "assistant") return [];
-    return [JSON.parse(clean(JSON.stringify(item))) as Block];
+    const kept = JSON.parse(clean(JSON.stringify(item))) as Block;
+    if (item.type !== "additional_tools" || !Array.isArray(kept.tools)) return [kept];
+    return [
+      {
+        ...kept,
+        tools: kept.tools.map((namespace: Block) =>
+          namespace.name === "functions" && Array.isArray(namespace.tools)
+            ? { ...namespace, tools: [...namespace.tools, ...directTools] }
+            : namespace,
+        ),
+      },
+    ];
   });
   const context = buildCodexAdditionalContext(
     { model: options.model, reasoningEffort: effort },

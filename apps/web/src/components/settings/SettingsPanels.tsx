@@ -1734,6 +1734,11 @@ export function ThreadsSettingsPanel() {
     (environment?.serverConfig
       ? providersByEnvironment.get(environment.environmentId)
       : undefined) ?? EMPTY_SERVER_PROVIDERS;
+  const codeModeUnavailable =
+    hasServerTargets &&
+    connectedEnvironments.every(
+      (target) => target.serverConfig?.environment.platform.os === "windows",
+    );
   const supportsAutoSettlementScope = connectedEnvironments.every(
     (target) => target.serverConfig?.environment.capabilities.threadAutoSettlementScope === true,
   );
@@ -1888,12 +1893,13 @@ export function ThreadsSettingsPanel() {
           <SettingsRow
             serverScoped
             {...searchableSetting("code-mode")}
-            description="Agents run one JavaScript program per tool call and see only its result. Scripts get the thread's file and shell access, outside provider rules and hooks. Supervised and Auto-accept edits ask first."
+            description="Agents run one JavaScript program per call, outside provider rules and hooks. Supervised and Auto-accept edits ask first; Allow for this thread lasts for the thread. Not available on Windows yet."
             settingKeys={["codeModeEnabled"]}
             control={
               <ScopedSwitch
                 settingKeys={["codeModeEnabled"]}
                 checked={settings.codeModeEnabled}
+                disabled={codeModeUnavailable}
                 onCheckedChange={(checked) => updateSettings({ codeModeEnabled: Boolean(checked) })}
                 aria-label="Code Mode"
               />

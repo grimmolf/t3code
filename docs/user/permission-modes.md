@@ -66,7 +66,7 @@ program can run several commands at once, repeat an edit across many files, or f
 output, and only what it returns goes back into the conversation. It works with every provider.
 
 Turn on **Code Mode** in **Settings → Threads → Agent tools**. The setting applies to the whole
-environment. Turning it off refuses the next script.
+environment. Turning it off refuses the next script. Code Mode is not available on Windows yet.
 
 | Mode                                  | Scripts                                                                                     |
 | ------------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -75,6 +75,9 @@ environment. Turning it off refuses the next script.
 | Plan mode                             | Refused.                                                                                    |
 
 A thread whose provider runs its mode as **Supervised** asks too.
+
+**Allow for this thread** lasts as long as the thread does, including after a restart. Nothing
+revokes it yet. To stop that thread's scripts, switch it to Plan mode, or turn Code Mode off.
 
 A script runs in the thread's project folder or worktree with T3 Code's own environment, and it
 stops after 10 minutes. Commands inside a script bypass the provider's own permission rules,

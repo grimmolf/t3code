@@ -404,10 +404,16 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                       "codeModeEnabled",
                       projectSelected
                         ? "Environment-wide setting. Select All projects to change it."
-                        : "Agents run one JavaScript program per tool call and see only its result. Scripts get the thread's file and shell access, outside provider rules and hooks. Supervised and Auto-accept edits ask first.",
+                        : "Agents run one JavaScript program per call, outside provider rules and hooks. Supervised and Auto-accept edits ask first; Allow for this thread lasts for the thread. Not available on Windows yet.",
                     )}
                     value={uniform("codeModeEnabled")}
-                    disabled={disabledFor("codeModeEnabled")}
+                    disabled={
+                      disabledFor("codeModeEnabled") ||
+                      targets.every(
+                        (target) =>
+                          target.environment.serverConfig.environment.platform.os === "windows",
+                      )
+                    }
                     onValueChange={(value) => write({ codeModeEnabled: value })}
                   />
                 </SettingsSection>

@@ -26,6 +26,7 @@ import {
 } from "@t3tools/contracts";
 
 import packageJson from "../../package.json" with { type: "json" };
+import * as CodeMode from "../codeMode/CodeMode.ts";
 import { parseBearerToken } from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -48,6 +49,7 @@ import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolExposure from "./McpToolExposure.ts";
 import { MCP_TOOL_EXPOSURE_HEADER } from "@t3tools/provider-core/server/mcpSession";
+import { T3_CODE_RUN_TOOL_NAME } from "@t3tools/shared/toolActivity";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
@@ -76,6 +78,8 @@ import * as WorktreeHandlers from "./toolkits/worktree/handlers.ts";
 import { WorktreeToolkit } from "./toolkits/worktree/tools.ts";
 import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
+import * as CodeRunHandlers from "./toolkits/codeRun/handlers.ts";
+import { CodeRunToolkit } from "./toolkits/codeRun/tools.ts";
 import * as ToolSearchHandlers from "./toolkits/toolSearch/handlers.ts";
 import { ToolSearchToolkit } from "./toolkits/toolSearch/tools.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
@@ -1361,7 +1365,10 @@ const layerToolExposure = Layer.effect(
     const server = yield* McpServer.McpServer;
     return McpToolExposure.make(
       () =>
-        server.tools.map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+        server.tools
+          // Only Claude threads get the code tool, and Claude lists everything up front.
+          .filter(({ tool }) => tool.name !== T3_CODE_RUN_TOOL_NAME)
+          .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
       () => server.notifications["notifications/tools/list_changed"]({}),
     );
   }),
@@ -1395,4 +1402,29 @@ export const layerToolSearch = Layer.mergeAll(
   layerDeferredListing,
 ).pipe(Layer.provide(layerToolExposure));
 
-export const layer = layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch));
+/** Hides `t3_code_run`, and refuses calls to it, unless the calling thread's instance offers it. */
+const codeRunVisibility = McpServer.visibility(
+  Effect.gen(function* () {
+    const codeMode = yield* CodeMode.CodeMode;
+    // Untraced: it runs on every list request and every call.
+    return Effect.fnUntraced(function* () {
+      const scope = Option.getOrUndefined(
+        yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
+      );
+      return (
+        scope?.thread !== undefined &&
+        scope.client === undefined &&
+        (yield* codeMode.offered(scope.thread.providerInstanceId))
+      );
+    });
+  }),
+);
+
+/** Outside layerTools: only Claude threads with Code Mode on list it. */
+export const layerCodeRunToolkit = toolkitRegistration(CodeRunToolkit, CodeRunHandlers.layer).pipe(
+  Layer.provide(codeRunVisibility.layer),
+);
+
+export const layer = layerMcpTransport(
+  Layer.mergeAll(layerTools, layerToolSearch, layerCodeRunToolkit),
+);

@@ -20,6 +20,7 @@ import {
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -30,6 +31,7 @@ import { McpSchema, McpServer, Tool, Toolkit } from "effect/ai";
 import { HttpBody, HttpClient, HttpClientRequest, HttpRouter, HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 
+import * as CodeMode from "../codeMode/CodeMode.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -1974,10 +1976,12 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
             }),
           ),
           McpHttpServer.layerToolSearch,
+          McpHttpServer.layerCodeRunToolkit,
         ),
       ).pipe(
         Layer.provide(ServerSettings.layerTest()),
         Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        Layer.provide(Layer.mock(CodeMode.CodeMode)({ offered: () => Effect.succeed(false) })),
         Layer.provide(
           Layer.mock(McpSessionRegistry.McpSessionRegistry)({
             resolve: (token) => Effect.succeed(scopes.get(token)),
@@ -2053,6 +2057,209 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       ).toEqual({ tools: [{ name: "preview_open", description: "Opens a browser preview." }] });
       expect(yield* deferring.listed).toEqual(["delegate_task", "preview_open", "tool_search"]);
       expect(yield* other.listed).toEqual(["delegate_task", "preview_open", "schedule_task"]);
+      expect(
+        (yield* deferring.call("tool_search", { query: "t3_code_run" })).structuredContent,
+      ).toEqual({ tools: [] });
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("interrupts a running t3_code_run when Claude cancels the call or drops it", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const claude = ProviderInstanceId.make("claudeAgent");
+      const token = "claudeToken";
+      const scope: McpInvocationContext.McpThreadInvocationScope = {
+        environmentId,
+        requestNamespace: token,
+        thread: {
+          threadId: ThreadId.make("thread-code-run"),
+          providerSessionId: token,
+          providerInstanceId: claude,
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+      const started = yield* Deferred.make<void>();
+      const interrupted = yield* Deferred.make<void>();
+      const runs = { started, interrupted };
+      const serverLayer = McpHttpServer.layerMcpTransport(McpHttpServer.layerCodeRunToolkit).pipe(
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(
+          Layer.mock(ThreadManagementService.ThreadManagementService)({
+            getThreadShell: (id) =>
+              Effect.succeed({
+                ...McpToolAccessTestkit.liveThreadShell(id),
+                providerInstanceId: claude,
+              }),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(CodeMode.CodeMode)({
+            offered: () => Effect.succeed(true),
+            run: () =>
+              Deferred.succeed(runs.started, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.onInterrupt(() => Deferred.succeed(runs.interrupted, undefined)),
+              ),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: (presented) => Effect.succeed(presented === token ? scope : undefined),
+          }),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+        Layer.build,
+      );
+      const httpClient = yield* HttpClient.HttpClient;
+      const headers = {
+        accept: "application/json, text/event-stream",
+        authorization: `Bearer ${token}`,
+      };
+      // Claude Code 2.1.325 asks for 2025-11-25, which T3 answers with its 2025-06-18 session.
+      const initialize = yield* httpClient.post("/mcp", {
+        headers,
+        body: HttpBody.text(
+          `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"claude-code","version":"2.1.325"}}}`,
+          "application/json",
+        ),
+      });
+      const post = (message: object) =>
+        httpClient.post("/mcp", {
+          headers: {
+            ...headers,
+            "mcp-session-id": initialize.headers["mcp-session-id"]!,
+            "mcp-protocol-version": "2025-06-18",
+          },
+          body: HttpBody.text(JSON.stringify({ jsonrpc: "2.0", ...message }), "application/json"),
+        });
+      const call = (id: number) =>
+        post({
+          id,
+          method: "tools/call",
+          params: { name: "t3_code_run", arguments: { code: "x" } },
+        });
+
+      yield* call(2).pipe(Effect.forkScoped);
+      yield* Deferred.await(runs.started);
+      yield* post({
+        method: "notifications/cancelled",
+        params: { requestId: 2, reason: "AbortError: remote-cancel" },
+      });
+      yield* Deferred.await(runs.interrupted);
+
+      runs.started = yield* Deferred.make<void>();
+      runs.interrupted = yield* Deferred.make<void>();
+      const dropped = yield* call(3).pipe(Effect.forkChild);
+      yield* Deferred.await(runs.started);
+      yield* Fiber.interrupt(dropped);
+      yield* Deferred.await(runs.interrupted);
+    }),
+  ).pipe(Effect.provide(NodeHttpServer.layerTest)),
+);
+
+it.effect("lists t3_code_run only to threads whose provider instance offers Code Mode", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const claude = ProviderInstanceId.make("claudeAgent");
+      const codex = ProviderInstanceId.make("codex");
+      const threadScope = (
+        token: string,
+        providerInstanceId: ProviderInstanceId,
+      ): McpInvocationContext.McpThreadInvocationScope => ({
+        environmentId,
+        requestNamespace: token,
+        thread: {
+          threadId: ThreadId.make(`thread-${token}`),
+          providerSessionId: token,
+          providerInstanceId,
+        },
+        client: undefined,
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      });
+      const scopes = new Map([
+        ["claudeToken", threadScope("claudeToken", claude)],
+        ["codexToken", threadScope("codexToken", codex)],
+      ]);
+      const clientScope: McpInvocationContext.McpInvocationScope = {
+        environmentId,
+        requestNamespace: "client:outside",
+        thread: undefined,
+        client: { sessionId: "outside", label: "Outside", access: "full-access" },
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 1,
+      };
+      const serverLayer = McpHttpServer.layerMcpTransport(McpHttpServer.layerCodeRunToolkit).pipe(
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
+        Layer.provide(
+          Layer.mock(CodeMode.CodeMode)({ offered: (id) => Effect.succeed(id === claude) }),
+        ),
+        Layer.provide(
+          Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+            resolve: (token) => Effect.succeed(scopes.get(token)),
+          }),
+        ),
+        Layer.provide(
+          Layer.succeed(McpHttpServer.McpClientAuthenticator, {
+            authenticate: (request) =>
+              Effect.succeed(
+                request.headers.authorization === "Bearer clientToken" ? clientScope : undefined,
+              ),
+          }),
+        ),
+      );
+      yield* HttpRouter.serve(serverLayer, { disableListenLog: true, disableLogger: true }).pipe(
+        Layer.build,
+      );
+      const httpClient = yield* HttpClient.HttpClient;
+      const session = Effect.fn("session")(function* (token: string) {
+        const headers = {
+          accept: "application/json, text/event-stream",
+          authorization: `Bearer ${token}`,
+        };
+        const initialize = yield* httpClient.post("/mcp", {
+          headers,
+          body: HttpBody.text(
+            `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"probe","version":"1.0.0"}}}`,
+            "application/json",
+          ),
+        });
+        return (method: string, params: object) =>
+          httpClient
+            .post("/mcp", {
+              headers: {
+                ...headers,
+                "mcp-session-id": initialize.headers["mcp-session-id"]!,
+                "mcp-protocol-version": "2025-06-18",
+              },
+              body: HttpBody.text(
+                JSON.stringify({ jsonrpc: "2.0", id: 2, method, params }),
+                "application/json",
+              ),
+            })
+            .pipe(Effect.flatMap((response) => response.json));
+      });
+      const listed = (rpc: Effect.Success<ReturnType<typeof session>>) =>
+        rpc("tools/list", {}).pipe(
+          Effect.map((body) =>
+            (body as { result: { tools: ReadonlyArray<{ name: string }> } }).result.tools.map(
+              (tool) => tool.name,
+            ),
+          ),
+        );
+
+      expect(yield* listed(yield* session("claudeToken"))).toEqual(["t3_code_run"]);
+      expect(yield* listed(yield* session("clientToken"))).toEqual([]);
+      const codexRpc = yield* session("codexToken");
+      expect(yield* listed(codexRpc)).toEqual([]);
+      expect(
+        yield* codexRpc("tools/call", { name: "t3_code_run", arguments: { code: "return 1" } }),
+      ).toMatchObject({ error: { message: expect.stringContaining("t3_code_run") } });
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );

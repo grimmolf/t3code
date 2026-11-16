@@ -119,6 +119,8 @@ import * as ProviderInstallation from "./provider/providerInstallation.ts";
 import * as CodexInstallation from "./provider/CodexInstallation.ts";
 import * as ProviderInstallationGate from "./provider/ProviderInstallationGate.ts";
 import * as ProviderInstanceRegistry from "./provider/ProviderInstanceRegistry.ts";
+import * as CodeMode from "./codeMode/CodeMode.ts";
+import * as CodeRunner from "./codeMode/CodeRunner.ts";
 import * as ProviderAdapterRegistry from "./orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderRegistry from "./provider/ProviderRegistry.ts";
 import * as ProviderUsageLimitsIngestion from "./provider/ProviderUsageLimitsIngestion.ts";
@@ -848,6 +850,7 @@ const layerMakeRoutes = Layer.mergeAll(
     speechStreamRouteLayer,
   ),
   McpHttpServer.layer.pipe(
+    Layer.provide(CodeMode.layer.pipe(Layer.provide(CodeRunner.layer))),
     Layer.provide(ProviderAdapterRegistry.layerFromProviderInstanceRegistry),
     Layer.provide(McpOAuth.layerMcpClientAuthenticator),
   ),

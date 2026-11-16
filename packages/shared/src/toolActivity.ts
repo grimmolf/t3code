@@ -26,7 +26,7 @@ export function claudeSkillInvocation(
   return name === undefined ? undefined : { name, args: asTrimmedString(record?.args) };
 }
 
-const T3_CODE_RUN_TOOL_NAME = "t3_code_run";
+export const T3_CODE_RUN_TOOL_NAME = "t3_code_run";
 
 const isT3CodeRunTool = (toolName: string | null | undefined) =>
   toolName != null && resolveT3McpToolName(toolName) === T3_CODE_RUN_TOOL_NAME;

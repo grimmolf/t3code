@@ -71,7 +71,7 @@ export class CodeModeAskError extends Schema.TaggedError<CodeModeAskError>()("Co
   }
 }
 
-// Under the 65-minute MCP tool timeout T3 gives Claude and Codex, with room for the run.
+// With the 10-minute run, under the 65-minute MCP tool timeout T3 sets for Claude, Codex and OpenCode.
 const ASK_TIMEOUT = Duration.minutes(50);
 
 export class CodeModeNotApprovedError extends Schema.TaggedError<CodeModeNotApprovedError>()(

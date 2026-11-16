@@ -82,6 +82,7 @@ const ran = { result: null, stdout: "", stderr: "", truncated: false, error: nul
 const startTurn = Effect.fn("startTurn")(function* (
   name: string,
   runtimeMode: RuntimeMode = "approval-required",
+  runInstanceId: ProviderInstanceId = instanceId,
 ) {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -154,7 +155,7 @@ const startTurn = Effect.fn("startTurn")(function* (
         id: runId,
         threadId,
         ordinal: 1,
-        providerInstanceId: instanceId,
+        providerInstanceId: runInstanceId,
         modelSelection,
         providerThreadId,
         userMessageId: MessageId.make(`message:${name}`),
@@ -237,13 +238,52 @@ const startTurn = Effect.fn("startTurn")(function* (
   return { threadId, runId };
 });
 
+/** Ends the thread's latest run, if it still runs, and starts the next one. */
+const startNextRun = Effect.fn("startNextRun")(function* (threadId: ThreadId, name: string) {
+  const threads = yield* ThreadManagementService.ThreadManagementService;
+  const projections = yield* ProjectionStore.ProjectionStoreV2;
+  const { runs } = yield* threads.getThreadRecords(threadId, ["runs"]);
+  const latest = runs.toSorted((a, b) => b.ordinal - a.ordinal)[0];
+  assert.ok(latest !== undefined);
+  const now = yield* DateTime.now;
+  if (latest.status === "running") {
+    yield* projections.apply({
+      id: EventId.make(`seed:${name}:ended`),
+      type: "run.updated",
+      threadId,
+      runId: latest.id,
+      occurredAt: now,
+      payload: { ...latest, status: "completed", completedAt: now },
+    } as OrchestrationV2DomainEvent);
+  }
+  yield* projections.apply({
+    id: EventId.make(`seed:${name}:next`),
+    type: "run.created",
+    threadId,
+    occurredAt: now,
+    payload: {
+      ...latest,
+      id: RunId.make(`run:${name}`),
+      ordinal: latest.ordinal + 1,
+      status: "running",
+      completedAt: null,
+    },
+  } as OrchestrationV2DomainEvent);
+});
+
 const withCodeMode = <A, E, R>(
   use: (codeMode: CodeMode.CodeMode["Service"], runs: Array<string>) => Effect.Effect<A, E, R>,
-  supportedRuntimeModes?: ReadonlyArray<RuntimeMode>,
+  options: {
+    readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
+  } = {},
 ) => {
   const runs: Array<string> = [];
   const instance = {
-    snapshot: { getSnapshot: Effect.succeed({ supportedRuntimeModes } as ServerProvider) },
+    snapshot: {
+      getSnapshot: Effect.succeed({
+        supportedRuntimeModes: options.supportedRuntimeModes,
+      } as ServerProvider),
+    },
   } as ProviderInstance;
   return Effect.flatMap(CodeMode.CodeMode, (codeMode) => use(codeMode, runs)).pipe(
     Effect.provide(
@@ -252,7 +292,7 @@ const withCodeMode = <A, E, R>(
           Layer.mergeAll(
             Layer.mock(ProjectService.ProjectService)({}),
             Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-              getInstance: () => Effect.succeed(instance),
+              getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
             }),
             Layer.mock(CodeRunner.CodeRunner)({
               run: (input) => Effect.sync(() => (runs.push(input.code), ran)),
@@ -306,9 +346,11 @@ const respond = (
   );
 
 const isNotApproved = Schema.is(CodeMode.CodeModeNotApprovedError);
-const notApproved = (exit: Exit.Exit<unknown, unknown>) => {
+/** Why a script did not run: the user's answer, or the refusal's tag. */
+const refusal = (exit: Exit.Exit<unknown, unknown>) => {
   const error = Option.getOrUndefined(Exit.findErrorOption(exit));
-  return isNotApproved(error) ? error.outcome : exit;
+  if (isNotApproved(error)) return error.outcome;
+  return typeof error === "object" && error !== null && "_tag" in error ? error._tag : exit;
 };
 
 it.effect("asks for each script until the user allows the thread", () =>
@@ -351,6 +393,7 @@ it.effect("asks for each script until the user allows the thread", () =>
       const recovery = yield* ProviderRuntimeRecoveryService.ProviderRuntimeRecoveryService;
       yield* recovery.reconcile("shutdown");
       yield* recovery.reconcile("startup");
+      yield* startNextRun(threadId, "after-restart");
       yield* codeMode.run(threadId, "return 'unasked'");
       assert.deepEqual(runs, ["return 'once'", "return 'allow'", "return 'unasked'"]);
       const requests = yield* threads.getThreadRecords(threadId, ["runtimeRequests"]);
@@ -369,55 +412,93 @@ it.effect("asks for each script until the user allows the thread", () =>
   ),
 );
 
-it.effect("asks in an Auto thread whose provider runs Auto as Supervised", () =>
+it.effect("asks where the running turn's provider may not run the thread's mode", () =>
   withCodeMode(
     (codeMode, runs) =>
       Effect.gen(function* () {
-        const { threadId } = yield* startTurn("downgraded", "auto");
-        const asked = yield* startAsking(codeMode, threadId, "return 'asked'");
-        yield* respond(threadId, asked.requestId, "accept");
+        const downgraded = yield* startTurn("downgraded", "auto");
+        const asked = yield* startAsking(codeMode, downgraded.threadId, "return 'asked'");
+        yield* respond(downgraded.threadId, asked.requestId, "accept");
         yield* Fiber.join(asked.script);
-        assert.deepEqual(runs, ["return 'asked'"]);
+
+        const unknown = ProviderInstanceId.make("unknown");
+        const unread = yield* startTurn("unread", "full-access", unknown);
+        const unreadAsked = yield* startAsking(codeMode, unread.threadId, "return 'unread'");
+        yield* respond(unread.threadId, unreadAsked.requestId, "accept");
+        yield* Fiber.join(unreadAsked.script);
+        assert.deepEqual(runs, ["return 'asked'", "return 'unread'"]);
       }),
-    ["approval-required", "full-access"],
+    { supportedRuntimeModes: ["approval-required", "full-access"] },
   ).pipe(Effect.provide(layerTest)),
 );
 
 it.effect("runs nothing when the user declines, the call is cancelled, or the turn stops", () =>
-  withCodeMode((codeMode, runs) =>
-    Effect.gen(function* () {
-      const threads = yield* ThreadManagementService.ThreadManagementService;
-      const { threadId, runId } = yield* startTurn("refuse");
-      const statusOf = (requestId: RuntimeRequestId) =>
-        threads
-          .getThreadRecords(threadId, ["runtimeRequests", "turnItems"], {
-            turnItemRequestIds: [requestId],
-          })
-          .pipe(
-            Effect.map((records) => [
-              records.runtimeRequests.find((request) => request.id === requestId)?.status,
-              records.turnItems[0]?.status,
-            ]),
-          );
+  Effect.gen(function* () {
+    yield* withCodeMode((codeMode, runs) =>
+      Effect.gen(function* () {
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        const settings = yield* ServerSettings.ServerSettingsService;
+        const { threadId, runId } = yield* startTurn("refuse");
+        const statusOf = (requestId: RuntimeRequestId) =>
+          threads
+            .getThreadRecords(threadId, ["runtimeRequests", "turnItems"], {
+              turnItemRequestIds: [requestId],
+            })
+            .pipe(
+              Effect.map((records) => [
+                records.runtimeRequests.find((request) => request.id === requestId)?.status,
+                records.turnItems[0]?.status,
+              ]),
+            );
 
-      const declined = yield* startAsking(codeMode, threadId, "return 'declined'");
-      yield* respond(threadId, declined.requestId, "decline");
-      assert.equal(notApproved(yield* Fiber.await(declined.script)), "declined");
+        const declined = yield* startAsking(codeMode, threadId, "return 'declined'");
+        yield* respond(threadId, declined.requestId, "decline");
+        assert.equal(refusal(yield* Fiber.await(declined.script)), "declined");
 
-      const cancelled = yield* startAsking(codeMode, threadId, "return 'cancelled'");
-      yield* Fiber.interrupt(cancelled.script);
-      assert.deepEqual(yield* statusOf(cancelled.requestId), ["resolved", "cancelled"]);
+        const cancelled = yield* startAsking(codeMode, threadId, "return 'cancelled'");
+        yield* Fiber.interrupt(cancelled.script);
+        assert.deepEqual(yield* statusOf(cancelled.requestId), ["resolved", "cancelled"]);
 
-      const stopped = yield* startAsking(codeMode, threadId, "return 'stopped'");
-      yield* threads.dispatch({
-        type: "run.interrupt",
-        commandId: CommandId.make("interrupt:refuse"),
-        threadId,
-        runId,
-      });
-      assert.equal(notApproved(yield* Fiber.await(stopped.script)), "closed");
-      assert.deepEqual(yield* statusOf(stopped.requestId), ["cancelled", "interrupted"]);
-      assert.deepEqual(runs, []);
-    }),
-  ).pipe(Effect.provide(layerTest)),
+        const planned = yield* startAsking(codeMode, threadId, "return 'planned'");
+        yield* threads.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("plan:refuse"),
+          threadId,
+          interactionMode: "plan",
+        });
+        yield* respond(threadId, planned.requestId, "accept");
+        assert.equal(refusal(yield* Fiber.await(planned.script)), "CodeModeRefusedError");
+        yield* threads.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("default:refuse"),
+          threadId,
+          interactionMode: "default",
+        });
+
+        const turnedOff = yield* startAsking(codeMode, threadId, "return 'turned off'");
+        yield* settings.updateSettings({ codeModeEnabled: false });
+        yield* respond(threadId, turnedOff.requestId, "accept");
+        assert.equal(refusal(yield* Fiber.await(turnedOff.script)), "CodeModeOffError");
+        yield* settings.updateSettings({ codeModeEnabled: true });
+
+        // The calling turn ends and another starts while its card stays open.
+        const ended = yield* startTurn("ended");
+        const orphaned = yield* startAsking(codeMode, ended.threadId, "return 'orphaned'");
+        yield* startNextRun(ended.threadId, "ended-next");
+        yield* respond(ended.threadId, orphaned.requestId, "accept");
+        assert.equal(refusal(yield* Fiber.await(orphaned.script)), "CodeModeTurnEndedError");
+
+        const stopped = yield* startAsking(codeMode, threadId, "return 'stopped'");
+        yield* threads.dispatch({
+          type: "run.interrupt",
+          commandId: CommandId.make("interrupt:refuse"),
+          threadId,
+          runId,
+        });
+        assert.equal(refusal(yield* Fiber.await(stopped.script)), "closed");
+        assert.deepEqual(yield* statusOf(stopped.requestId), ["cancelled", "interrupted"]);
+        assert.deepEqual(runs, []);
+      }),
+    );
+  }).pipe(Effect.provide(layerTest)),
 );

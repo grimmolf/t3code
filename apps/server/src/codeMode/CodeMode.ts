@@ -44,6 +44,15 @@ export class CodeModeRefusedError extends Schema.TaggedError<CodeModeRefusedErro
   }
 }
 
+export class CodeModeTurnEndedError extends Schema.TaggedError<CodeModeTurnEndedError>()(
+  "CodeModeTurnEndedError",
+  { threadId: ThreadId },
+) {
+  override get message(): string {
+    return `The turn that called t3_code_run in thread ${this.threadId} is no longer running, so the script did not run.`;
+  }
+}
+
 export class CodeModeNoWorkspaceError extends Schema.TaggedError<CodeModeNoWorkspaceError>()(
   "CodeModeNoWorkspaceError",
   { threadId: ThreadId },
@@ -101,6 +110,7 @@ export class CodeMode extends Context.Service<
       CodeRunner.CodeRunOutput,
       | CodeModeOffError
       | CodeModeRefusedError
+      | CodeModeTurnEndedError
       | CodeModeNoWorkspaceError
       | CodeModeAskError
       | CodeModeNotApprovedError
@@ -205,20 +215,34 @@ const make = Effect.gen(function* () {
     });
   });
 
-  const run = Effect.fn("CodeMode.run")(function* (threadId: ThreadId, code: string) {
+  /** What the thread allows now, judged by the provider its running turn is on. */
+  const permit = Effect.fn("CodeMode.permit")(function* (threadId: ThreadId) {
     if (!(yield* offered)) return yield* new CodeModeOffError();
     const shell = yield* threads.getThreadShell(threadId).pipe(Effect.orElseSucceed(() => null));
     if (shell === null) return yield* new CodeModeNoWorkspaceError({ threadId });
-    const instance = yield* providerInstances.getInstance(shell.modelSelection.instanceId);
-    const supportedRuntimeModes =
+    const running = yield* threads
+      .getThreadRecords(threadId, ["runs"], { runStatuses: ["running"] })
+      .pipe(
+        Effect.map(({ runs }) => runs.toSorted((a, b) => a.ordinal - b.ordinal)[0]),
+        Effect.orElseSucceed(() => undefined),
+      );
+    if (running === undefined) return yield* new CodeModeTurnEndedError({ threadId });
+    const instance = yield* providerInstances.getInstance(running.providerInstanceId);
+    // A provider T3 cannot read may not run the thread's mode, so it asks.
+    const runtimeMode =
       instance === undefined
-        ? undefined
-        : (yield* instance.snapshot.getSnapshot).supportedRuntimeModes;
-    const decision = codeModeDecision({
-      runtimeMode: providerRuntimeMode(shell.runtimeMode, supportedRuntimeModes),
-      interactionMode: shell.interactionMode,
-    });
+        ? "approval-required"
+        : providerRuntimeMode(
+            shell.runtimeMode,
+            (yield* instance.snapshot.getSnapshot).supportedRuntimeModes,
+          );
+    const decision = codeModeDecision({ runtimeMode, interactionMode: shell.interactionMode });
     if (decision === "refuse") return yield* new CodeModeRefusedError();
+    return { shell, runId: running.id, decision };
+  });
+
+  const run = Effect.fn("CodeMode.run")(function* (threadId: ThreadId, code: string) {
+    const { shell, runId, decision } = yield* permit(threadId);
     const cwd =
       shell.worktreePath ??
       Option.getOrUndefined(
@@ -226,6 +250,10 @@ const make = Effect.gen(function* () {
       )?.workspaceRoot;
     if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
     if (decision === "ask") yield* askLocks.withLock(threadId, ask(threadId, code));
+    // The card can outlast the setting, the thread's mode, and the turn that called.
+    if ((yield* permit(threadId)).runId !== runId) {
+      return yield* new CodeModeTurnEndedError({ threadId });
+    }
     return yield* runner.run({ code, cwd, environment });
   });
 

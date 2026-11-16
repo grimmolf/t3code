@@ -19,6 +19,7 @@ const handlers = {
       Effect.catchTags({
         CodeModeOffError: failure("capability_denied"),
         CodeModeRefusedError: failure("interaction_mode_escalation_denied"),
+        CodeModeTurnEndedError: failure("run_not_found"),
         CodeModeNoWorkspaceError: failure("thread_not_found"),
         CodeModeAskError: failure("orchestration_error"),
         CodeModeNotApprovedError: failure("capability_denied"),

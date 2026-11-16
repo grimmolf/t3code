@@ -1,11 +1,15 @@
 import { expect, it } from "@effect/vitest";
 import {
   EnvironmentId,
+  type OrchestrationV2Run,
   type Project,
   ProjectId,
   ProviderInstanceId,
+  RunId,
+  type ServerProvider,
   ThreadId,
 } from "@t3tools/contracts";
+import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -27,13 +31,24 @@ const threadId = ThreadId.make("thread:code-run");
 const environment = { PATH: "/usr/bin", HOME: "/home/user" };
 const ran = { result: 12, stdout: "", stderr: "", truncated: false, error: null };
 
+const codex = ProviderInstanceId.make("codex");
+const running = {
+  id: RunId.make("run:code-run"),
+  ordinal: 1,
+  providerInstanceId: codex,
+  status: "running",
+} as OrchestrationV2Run;
+const instance = {
+  snapshot: { getSnapshot: Effect.succeed({} as ServerProvider) },
+} as ProviderInstance;
+
 const call = Effect.fn("call")(function* (caller: {
   readonly codeModeEnabled?: boolean;
   readonly client?: boolean;
   readonly platform?: NodeJS.Platform;
 }) {
   const runs: Array<CodeRunner.CodeRunInput> = [];
-  const shell = { ...liveThreadShell(threadId, caller), projectId: ProjectId.make("project:acme") };
+  const shell = { ...liveThreadShell(threadId), projectId: ProjectId.make("project:acme") };
   const layerDependencies = Layer.mergeAll(
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
       environmentId: EnvironmentId.make("environment:code-run"),
@@ -44,7 +59,7 @@ const call = Effect.fn("call")(function* (caller: {
           : {
               threadId,
               providerSessionId: "provider:code-run",
-              providerInstanceId: ProviderInstanceId.make("codex"),
+              providerInstanceId: codex,
             },
       client:
         caller.client === true
@@ -55,6 +70,10 @@ const call = Effect.fn("call")(function* (caller: {
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
       getThreadShell: () => Effect.succeed(shell),
+      getThreadRecords: (() =>
+        Effect.succeed({
+          runs: [running],
+        })) as unknown as ThreadManagement.ThreadManagementService["Service"]["getThreadRecords"],
     }),
   );
   const layerCodeMode = CodeMode.layer.pipe(
@@ -65,7 +84,7 @@ const call = Effect.fn("call")(function* (caller: {
         Layer.succeed(HostProcess.Environment, environment),
         Layer.succeed(HostProcess.Platform, caller.platform ?? "linux"),
         Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
-          getInstance: () => Effect.undefined,
+          getInstance: () => Effect.succeed(instance),
         }),
         Layer.mock(ProjectService.ProjectService)({
           getById: () => Effect.succeedSome({ workspaceRoot: "/home/user/acme" } as Project),

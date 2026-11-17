@@ -400,7 +400,12 @@ it.layer(layerTest)("CodeRunner", (it) => {
             "for (const args of [{ n: 10n }, circular, () => 1, { text: 'x'.repeat(2_000_000) }]) {",
             "  refused.push(await t3.t3_thread_list(args).then(() => 'sent', (error) => [error.name, error.message]));",
             "}",
-            "return { refused, after: await t3.t3_thread_read({}) };",
+            // Refused in the session, before any reply from T3 could arrive.
+            "let refusedAtOnce = false;",
+            "const large = t3.t3_thread_list({ text: 'x'.repeat(100_000) }).catch(() => { refusedAtOnce = true; });",
+            "await null; await null;",
+            "const early = refusedAtOnce; await large;",
+            "return { refused, early, after: await t3.t3_thread_read({}) };",
           ].join("\n"),
           call: (tool) => Effect.sync(() => (calls.push(tool), "read")),
         });
@@ -414,6 +419,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
               ["T3ToolError", `${notJson}.`],
               ["T3ToolError", "t3.t3_thread_list: the request is larger than 64 KiB."],
             ],
+            early: true,
             after: "read",
           },
           error: null,

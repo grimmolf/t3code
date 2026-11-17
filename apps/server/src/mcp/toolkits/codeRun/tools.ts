@@ -1,5 +1,5 @@
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
-import { T3_CODE_RUN_TOOL_NAME } from "@t3tools/shared/toolActivity";
+import { T3_CODE_RUN_TOOL_NAME } from "@t3tools/shared/t3McpToolPresentation";
 import * as Duration from "effect/Duration";
 import * as Schema from "effect/Schema";
 import { McpSchema, Tool, Toolkit } from "effect/ai";

@@ -51,8 +51,8 @@ import {
   COMPUTER_USE_TOOL_SOURCE,
   dynamicToolSurface,
   dynamicToolTitle,
-  T3_CODE_RUN_TOOL_NAME,
 } from "@t3tools/shared/toolActivity";
+import { T3_CODE_RUN_TOOL_NAME } from "@t3tools/shared/t3McpToolPresentation";
 import { getModelSelectionStringOptionValue, modelSelectionsEqual } from "@t3tools/shared/model";
 import { appendGeneratedImageEmbeds } from "@t3tools/shared/generatedImageMarkdown";
 import { resolveSpawnCommand } from "@t3tools/shared/shell";

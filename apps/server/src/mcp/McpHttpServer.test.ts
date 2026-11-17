@@ -2059,13 +2059,18 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       ).toEqual({ tools: [{ name: "preview_open", description: "Opens a browser preview." }] });
       expect(yield* deferring.listed).toEqual(["delegate_task", "preview_open", "tool_search"]);
       expect(yield* other.listed).toEqual(["delegate_task", "preview_open", "schedule_task"]);
-      expect(
-        (yield* deferring.call("tool_search", { query: "t3_code_run" })).structuredContent,
-      ).toEqual({ tools: [] });
+      const codeTools = deferring
+        .call("tool_search", { query: "t3_code_run t3_code_poll t3_code_reset" })
+        .pipe(
+          Effect.map((result) =>
+            (result.structuredContent as { tools: ReadonlyArray<{ name: string }> }).tools
+              .map((tool) => tool.name)
+              .toSorted(),
+          ),
+        );
+      expect(yield* codeTools).toEqual([]);
       yield* Ref.set(codeModeOn, true);
-      expect(
-        (yield* deferring.call("tool_search", { query: "t3_code_run" })).structuredContent,
-      ).toMatchObject({ tools: [{ name: "t3_code_run" }] });
+      expect(yield* codeTools).toEqual(["t3_code_poll", "t3_code_reset", "t3_code_run"]);
     }),
   ).pipe(Effect.provide(NodeHttpServer.layerTest)),
 );
@@ -2265,8 +2270,9 @@ it.effect(
         const claudeRpc = yield* session("claudeToken");
         const codexRpc = yield* session("codexToken");
         const clientRpc = yield* session("clientToken");
-        expect(yield* listed(claudeRpc)).toEqual(["t3_code_run"]);
-        expect(yield* listed(codexRpc)).toEqual(["t3_code_run"]);
+        const codeTools = ["t3_code_run", "t3_code_poll", "t3_code_reset"];
+        expect(yield* listed(claudeRpc)).toEqual(codeTools);
+        expect(yield* listed(codexRpc)).toEqual(codeTools);
         expect(yield* listed(clientRpc)).toEqual([]);
         expect(yield* clientRpc("tools/call", codeRunCall)).toMatchObject(refused);
 

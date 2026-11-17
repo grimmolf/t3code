@@ -49,7 +49,6 @@ import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpToolAccess from "./McpToolAccess.ts";
 import * as McpToolExposure from "./McpToolExposure.ts";
 import { MCP_TOOL_EXPOSURE_HEADER } from "@t3tools/provider-core/server/mcpSession";
-import { T3_CODE_RUN_TOOL_NAME } from "@t3tools/shared/toolActivity";
 import * as OrchestratorMcpService from "./OrchestratorMcpService.ts";
 import { PreviewControlsToolkit } from "./toolkits/previewControls/tools.ts";
 import * as PreviewControlsHandlers from "./toolkits/previewControls/handlers.ts";
@@ -1364,11 +1363,12 @@ const layerToolExposure = Layer.effect(
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
     const codeMode = yield* CodeMode.CodeMode;
+    const codeRunTools: ReadonlySet<string> = new Set(Object.keys(CodeRunToolkit.tools));
     return McpToolExposure.make(
       codeMode.offered.pipe(
         Effect.map((codeRunOffered) =>
           server.tools
-            .filter(({ tool }) => codeRunOffered || tool.name !== T3_CODE_RUN_TOOL_NAME)
+            .filter(({ tool }) => codeRunOffered || !codeRunTools.has(tool.name))
             .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
         ),
       ),
@@ -1405,7 +1405,7 @@ export const layerToolSearch = Layer.mergeAll(
   layerDeferredListing,
 ).pipe(Layer.provide(layerToolExposure));
 
-/** Hides `t3_code_run`, and refuses calls to it, unless Code Mode is on and a thread is calling. */
+/** Hides the code tools, and refuses calls to them, unless Code Mode is on and a thread is calling. */
 const codeRunVisibility = McpServer.visibility(
   Effect.gen(function* () {
     const codeMode = yield* CodeMode.CodeMode;

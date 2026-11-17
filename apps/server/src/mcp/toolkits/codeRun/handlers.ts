@@ -1,4 +1,5 @@
 import { OrchestratorMcpFailure } from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 
 import * as CodeMode from "../../../codeMode/CodeMode.ts";
@@ -10,6 +11,11 @@ import { CodeRunToolkit } from "./tools.ts";
 const failure = (code: OrchestratorMcpFailure["code"]) => (error: { readonly message: string }) =>
   Effect.fail(new OrchestratorMcpFailure({ code, message: error.message }));
 
+const threadCaller = (operation: string) =>
+  McpInvocationContext.McpInvocationContext.pipe(
+    Effect.flatMap((scope) => McpInvocationContext.requireThreadScope(scope, operation)),
+  );
+
 const noBindings: CodeMode.CodeModeBindings = {
   tools: [],
   call: (tool) =>
@@ -18,18 +24,16 @@ const noBindings: CodeMode.CodeModeBindings = {
 
 const handlers = {
   t3_code_run: McpToolAccess.actsAsCaller(({ code }) =>
-    McpInvocationContext.McpInvocationContext.pipe(
-      Effect.flatMap((scope) => McpInvocationContext.requireThreadScope(scope, "t3_code_run")),
-      Effect.flatMap(({ thread }) =>
-        Effect.flatMap(CodeMode.CodeMode, (codeMode) =>
-          codeMode.run({
-            threadId: thread.threadId,
-            providerSessionId: thread.providerSessionId,
-            code,
-            bindings: noBindings,
-          }),
-        ),
-      ),
+    Effect.gen(function* () {
+      const { thread } = yield* threadCaller("t3_code_run");
+      const codeMode = yield* CodeMode.CodeMode;
+      return yield* codeMode.run({
+        threadId: thread.threadId,
+        providerSessionId: thread.providerSessionId,
+        code,
+        bindings: noBindings,
+      });
+    }).pipe(
       Effect.catchTags({
         CodeModeOffError: failure("capability_denied"),
         CodeModeRefusedError: failure("interaction_mode_escalation_denied"),
@@ -41,6 +45,28 @@ const handlers = {
         CodeRunStartError: failure("orchestration_error"),
       }),
     ),
+  ),
+  t3_code_poll: McpToolAccess.readsAsCaller(({ handle, waitSeconds }) =>
+    Effect.gen(function* () {
+      const { thread } = yield* threadCaller("t3_code_poll");
+      const codeMode = yield* CodeMode.CodeMode;
+      return yield* codeMode.poll({
+        threadId: thread.threadId,
+        providerSessionId: thread.providerSessionId,
+        handle,
+        wait: waitSeconds === undefined ? CodeMode.YIELD_AFTER : Duration.seconds(waitSeconds),
+      });
+    }).pipe(Effect.catchTags({ CodeModeUnknownHandleError: failure("invalid_request") })),
+  ),
+  t3_code_reset: McpToolAccess.actsAsCaller(() =>
+    Effect.gen(function* () {
+      const { thread } = yield* threadCaller("t3_code_reset");
+      const codeMode = yield* CodeMode.CodeMode;
+      return yield* codeMode.reset({
+        threadId: thread.threadId,
+        providerSessionId: thread.providerSessionId,
+      });
+    }),
   ),
 } satisfies McpToolAccess.Handlers<typeof CodeRunToolkit.tools>;
 

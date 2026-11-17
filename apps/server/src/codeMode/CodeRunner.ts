@@ -98,7 +98,7 @@ const SESSION_HEAP_MIB = 256;
 // A result line holds at most 64K characters of JSON, which escaping can grow several times over.
 const CHANNEL_LINE_LIMIT = 1024 * 1024;
 const TRUNCATED_MARKER = "\n[truncated]";
-// The child writes these keys first, so a call too long to parse can still be refused.
+// The child writes these keys first, so a call too long to hold can be refused before it ends.
 const CALL_HEAD = /^\{"type":"call","evaluation":"[^"\\]*","callId":(\d+),"tool":"([\w-]+)"/u;
 
 const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
@@ -461,13 +461,13 @@ const make = Effect.gen(function* () {
       );
     });
 
+    const tooLarge = (callId: number, tool: string) =>
+      send(refusal(callId, `t3.${tool}: the request is larger than 64 KiB.`));
     const refuseOversized = (line: string) => {
       const head = CALL_HEAD.exec(line.slice(0, 1024));
       return head === null
         ? Effect.succeed(false)
-        : send(refusal(Number(head[1]), `t3.${head[2]}: the request is larger than 64 KiB.`)).pipe(
-            Effect.as(true),
-          );
+        : tooLarge(Number(head[1]), head[2]!).pipe(Effect.as(true));
     };
 
     const unreadable = "The session wrote a message T3 could not read, so it was stopped.";
@@ -490,11 +490,12 @@ const make = Effect.gen(function* () {
         const line = pending.slice(0, newline);
         pending = pending.slice(newline + 1);
         newline = pending.indexOf("\n");
-        if (Buffer.byteLength(line) > CALL_LIMIT_BYTES && (yield* refuseOversized(line))) continue;
         const message = decodeChildMessage(line);
         if (Option.isNone(message)) return yield* end(unreadable);
         if (message.value.type === "call") {
-          yield* onCall(message.value);
+          yield* Buffer.byteLength(line) > CALL_LIMIT_BYTES
+            ? tooLarge(message.value.callId, message.value.tool)
+            : onCall(message.value);
           continue;
         }
         const result = message.value;

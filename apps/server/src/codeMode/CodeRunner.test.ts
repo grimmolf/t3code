@@ -430,22 +430,34 @@ it.layer(layerTest)("CodeRunner", (it) => {
       }),
     );
 
-    it.effect("refuses a call line too long to read without stopping the session", () =>
-      Effect.gen(function* () {
-        const started = yield* session();
-        const output = yield* started.evaluate({
-          tools,
-          code: [
-            `const line = '{"type":"call","evaluation":"forged","callId":999999,"tool":"t3_thread_list","args":"' + "x".repeat(2_000_000) + '"}\\n';`,
-            "const data = Buffer.from(line);",
-            "for (let at = 0; at < data.length; ) at += require('node:fs').writeSync(3, data, at);",
-            "return await t3.t3_thread_list({});",
-          ].join("\n"),
-          call: () => Effect.succeed("listed"),
-        });
+    it.effect(
+      "refuses a call line over 64 KiB, in any key order, without stopping the session",
+      () =>
+        Effect.gen(function* () {
+          const started = yield* session();
+          const sizes: Array<number> = [];
+          const output = yield* started.evaluate({
+            tools,
+            code: [
+              "const writeAll = (line) => { const data = Buffer.from(line); for (let at = 0; at < data.length; ) at += require('node:fs').writeSync(3, data, at); };",
+              `writeAll('{"type":"call","evaluation":"forged","callId":999999,"tool":"t3_thread_list","args":"' + "x".repeat(2_000_000) + '"}\\n');`,
+              // Read off a real call, so only the size check can refuse the forged one below.
+              "const { Writable } = require('node:stream');",
+              "const write = Writable.prototype.write;",
+              "let evaluation;",
+              `Writable.prototype.write = function (chunk, ...rest) { evaluation ??= /"evaluation":("[^"]+")/.exec(String(chunk))?.[1]; return write.call(this, chunk, ...rest); };`,
+              "await t3.t3_thread_list({});",
+              "Writable.prototype.write = write;",
+              "writeAll(JSON.stringify({ args: 'x'.repeat(100_000), type: 'call', evaluation: JSON.parse(evaluation), callId: 999998, tool: 't3_thread_list' }) + '\\n');",
+              "return await t3.t3_thread_list({});",
+            ].join("\n"),
+            call: (_tool, args) =>
+              Effect.sync(() => (sizes.push(JSON.stringify(args).length), "listed")),
+          });
 
-        expect(output).toMatchObject({ result: "listed", error: null, t3Calls: 1 });
-      }),
+          expect(output).toMatchObject({ result: "listed", error: null, t3Calls: 2 });
+          expect(sizes).toEqual([2, 2]);
+        }),
     );
 
     it.effect("stops the t3 calls an evaluation did not await once it returns", () =>

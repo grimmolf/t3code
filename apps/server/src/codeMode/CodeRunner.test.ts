@@ -291,15 +291,16 @@ it.layer(layerTest)("CodeRunner", (it) => {
         const evaluate = (code: string) => started.evaluate({ code, tools: [], call: noCalls });
 
         const first = yield* evaluate(
-          `globalThis.kept = 1; var local = 2; let block = 3; function helper() {} console.log("one");`,
+          // lines, path and pending are also names the runner uses for itself.
+          `globalThis.kept = 1; globalThis.lines = ["a", "b"]; globalThis.path = "p"; globalThis.pending = 3; var local = 2; let block = 3; function helper() {} console.log("one");`,
         );
         const second = yield* evaluate(
-          `console.log("two"); return [typeof kept, typeof local, typeof block, typeof helper];`,
+          `console.log("two"); return [typeof kept, typeof local, typeof block, typeof helper, lines.length, path, pending];`,
         );
 
         expect(first).toMatchObject({ stdout: "one\n", error: null });
         expect(second).toMatchObject({
-          result: ["number", "undefined", "undefined", "undefined"],
+          result: ["number", "undefined", "undefined", "undefined", 2, "p", 3],
           stdout: "two\n",
           error: null,
         });

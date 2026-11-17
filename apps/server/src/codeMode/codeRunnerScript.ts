@@ -5,6 +5,8 @@
  * No `${` below: this is a template literal.
  */
 export const CODE_RUNNER_SCRIPT = String.raw`"use strict";
+// In a block, these names stay off the global scope, where they would hide globalThis values.
+{
 delete process.env.ELECTRON_RUN_AS_NODE;
 const fs = require("node:fs");
 const net = require("node:net");
@@ -223,4 +225,5 @@ lines.on("line", (line) => {
   else if (message.type === "reply") reply(message);
 });
 lines.on("close", () => process.exit(0));
+}
 `;

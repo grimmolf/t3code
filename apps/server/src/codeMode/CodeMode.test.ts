@@ -1134,6 +1134,7 @@ it.effect(
               "CodeModeSessionEndedError",
             );
             assert.notInclude(runs, "return 'flapped'");
+            assert.deepEqual(yield* Queue.clear(endings), [modeChanged]);
           }),
         { endings, threads: holdRaced },
       );

@@ -1,0 +1,22 @@
+== Claude: step 1 (new thread)
+thread mcp:9faa4489-8468-4a09-8493-f5eb1b54c1e5
+The count is **13**: `globalThis.files` now holds one `{path, text}` entry for each file under `src/`.
+== Claude: step 2
+`globalThis.files` was still there: the script found all 13 entries without reading the disk again.
+
+Twelve files contain "maxAttempts: 3":
+
+- `<fixture>/src/m01.js` through `m12.js` (all in the same `src/` folder)
+
+The 13th file is not in the list.
+== Claude: step 3
+Result from one `t3_code_run` call:
+
+- `toolCount`: **10**
+- `threadTitles` (first 3):
+  1. REPL demo: Claude
+  2. Demo: Claude runs a script with Code Mode on
+  3. Demo: Claude runs a script
+== Claude: step 4
+The job finished with the result `"slow job done"`. It took **1 poll**: the first `t3_code_poll` call, with a 20-second wait, returned `done`.
+THREAD_ID=mcp:9faa4489-8468-4a09-8493-f5eb1b54c1e5

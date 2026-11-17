@@ -1,0 +1,10 @@
+== Codex: step 1 (new thread)
+thread mcp:fe13c97b-d4d6-41f6-907b-8a3155534801
+Read 13 files under `src/` and stored them in `globalThis.files`.
+== Codex: step 2
+`globalThis.files` was still there. The search returned 12 paths: `src/m01.js` through `src/m12.js`.
+== Codex: step 3
+Returned `{toolCount: 10, threadTitles: ["REPL demo: Codex", "REPL demo: Claude", "Demo: Claude runs a script with Code Mode on"]}`.
+== Codex: step 4
+Final result: `slow job done`. It took 1 poll.
+THREAD_ID=mcp:fe13c97b-d4d6-41f6-907b-8a3155534801

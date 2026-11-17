@@ -92,6 +92,8 @@ export const CALL_STOP_GRACE = Duration.seconds(2);
 const CALLS_HELD =
   "A t3 call did not stop when its evaluation finished, so the session was stopped.";
 export const RESPONSE_LIMIT_BYTES = 64 * 1024;
+/** What arrives between evaluations, kept for the next one's stderr. */
+const UNOWNED_LIMIT_BYTES = 4 * 1024;
 /** Room left in the response for what Code Mode adds around an evaluation's output. */
 const ENVELOPE_BYTES = 1024;
 /** Each `t3` request and each result sent back to the script. */
@@ -141,6 +143,8 @@ const fitResponse = (input: {
   readonly stderr: Collected;
   /** A `$` command's output was cut to its end. */
   readonly shellTruncated: boolean;
+  /** What arrived on stderr before the evaluation started was cut to its end. */
+  readonly earlierCut: boolean;
   readonly t3Calls: number;
 }): CodeRunOutput => {
   let remaining =
@@ -155,7 +159,11 @@ const fitResponse = (input: {
       t3Calls: input.t3Calls,
     });
   let truncated =
-    input.resultCut || input.stdout.truncated || input.stderr.truncated || input.shellTruncated;
+    input.resultCut ||
+    input.stdout.truncated ||
+    input.stderr.truncated ||
+    input.shellTruncated ||
+    input.earlierCut;
   const take = (text: string, alreadyCut: boolean) => {
     const whole = alreadyCut ? text + TRUNCATED_MARKER : text;
     if (jsonBytes(whole) <= remaining) {
@@ -262,6 +270,8 @@ interface Kept {
 interface Capture extends Kept {
   readonly marker: string;
   readonly seen: Deferred.Deferred<void>;
+  /** What arrived before the evaluation started was cut to its last `UNOWNED_LIMIT_BYTES`. */
+  earlierCut: boolean;
 }
 
 interface Running {
@@ -292,23 +302,36 @@ const append = (kept: Kept, text: string) => {
 
 /**
  * Hands each running evaluation what its process writes before the evaluation's marker.
- * What arrives between evaluations is kept for the next one when `keepsUnowned` is set,
- * and dropped otherwise.
+ * The last `UNOWNED_LIMIT_BYTES` of what arrives between evaluations is kept for the next one
+ * when `keepsUnowned` is set, and dropped otherwise.
  * @internal Exported for tests.
  */
 export const makeOutput = (keepsUnowned: boolean) => {
   const decoder = new TextDecoder();
   let capture: Capture | undefined;
   let carry = "";
-  const unowned: Kept = { text: "", bytes: 0, truncated: false };
+  let unowned = "";
+  let unownedCut = false;
+  // Only the latest output is kept, so a leftover timer cannot crowd out the next evaluation's own.
   const keep = (text: string) => {
-    if (keepsUnowned) append(unowned, text);
+    if (!keepsUnowned || text === "") return;
+    const bytes = Buffer.from(unowned + text);
+    if (bytes.length <= UNOWNED_LIMIT_BYTES) {
+      unowned += text;
+      return;
+    }
+    let start = bytes.length - UNOWNED_LIMIT_BYTES;
+    // Starts on a whole UTF-8 character, never a continuation byte.
+    while ((bytes[start]! & 0xc0) === 0x80) start += 1;
+    unowned = bytes.subarray(start).toString("utf8");
+    unownedCut = true;
   };
   /** Moves what arrived with no evaluation to own it onto the end of `into`. */
-  const claim = (into: Kept) => {
-    append(into, unowned.text);
-    if (unowned.truncated) into.truncated = true;
-    Object.assign(unowned, { text: "", bytes: 0, truncated: false });
+  const claim = (into: Capture) => {
+    append(into, unowned);
+    if (unownedCut) into.earlierCut = true;
+    unowned = "";
+    unownedCut = false;
   };
   return {
     install: (next: Capture) => {
@@ -621,6 +644,7 @@ const make = Effect.gen(function* () {
         },
         stderr: { text: running.stderr.text, truncated: running.stderr.truncated || heldOpen },
         shellTruncated: Option.isSome(settled) && settled.value.shellTruncated,
+        earlierCut: running.stderr.earlierCut,
         t3Calls: running.calls,
       });
     });
@@ -632,6 +656,7 @@ const make = Effect.gen(function* () {
         text: "",
         bytes: 0,
         truncated: false,
+        earlierCut: false,
         seen: Deferred.makeUnsafe<void>(),
       });
       const id = yield* randomUuidV4;

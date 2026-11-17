@@ -284,13 +284,14 @@ it.layer(layerTest)("CodeRunner", (it) => {
     }),
   );
 
-  it("gives the next evaluation's stderr what arrived between evaluations, within the cap", () => {
+  it("gives the next evaluation's stderr the last 4 KiB of what arrived between evaluations, then its own", () => {
     const stderr = CodeRunner.makeOutput(true);
     const capture = (marker: string) => ({
       marker,
       text: "",
       bytes: 0,
       truncated: false,
+      earlierCut: false,
       seen: Deferred.makeUnsafe<void>(),
     });
     const feed = (text: string) => stderr.feed(new TextEncoder().encode(text));
@@ -302,12 +303,14 @@ it.layer(layerTest)("CodeRunner", (it) => {
     const second = capture("<2>");
     stderr.install(second);
     feed(" two<2>");
-    feed("x".repeat(CodeRunner.RESPONSE_LIMIT_BYTES + 1));
+    // 4 KiB from the end falls inside a two-byte é, so the kept part starts at the next one.
+    feed("é".repeat(CodeRunner.RESPONSE_LIMIT_BYTES) + "TAIL!");
     const third = capture("<3>");
     stderr.install(third);
+    feed("own<3>");
 
     expect([first.text, second.text]).toEqual(["one", "after between two"]);
-    expect(third).toMatchObject({ bytes: CodeRunner.RESPONSE_LIMIT_BYTES, truncated: true });
+    expect(third).toMatchObject({ text: "é".repeat(2045) + "TAIL!own", earlierCut: true });
   });
 
   describe("session", () => {

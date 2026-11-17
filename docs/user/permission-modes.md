@@ -83,10 +83,11 @@ A thread whose provider runs its mode as **Supervised** asks too.
 revokes it yet. To stop that thread's scripts, switch it to Plan mode, or turn Code Mode off.
 
 Scripts run in the thread's project folder or worktree with T3 Code's own environment. A script
-stops after 10 minutes, or when the turn that started it ends, the thread's mode changes, or the
-thread is archived. The session itself ends after 10 idle minutes, when the agent resets it, when
-the provider session ends, or when T3 Code restarts, and the agent is told its stored values are
-gone. Commands inside a script bypass the provider's own permission rules, hooks, and safety
-checks. T3 Code tools a script calls run with the thread's own permissions. Some providers may
-also ask before they call the tool. Turn Code Mode on only where you trust agents with the
-thread's file and shell access.
+stops after 10 minutes, or when the turn that started it ends or the thread is archived. Any
+change to the thread's mode ends its session, even between scripts. The session also ends after
+10 idle minutes, when the agent resets it, when the provider session ends, or when T3 Code
+restarts, and the agent is told its stored values are gone. Timers and background work a script
+leaves behind keep running until the session ends. Commands inside a script bypass the
+provider's own permission rules, hooks, and safety checks. T3 Code tools a script calls run with
+the thread's own permissions. Some providers may also ask before they call the tool. Turn Code
+Mode on only where you trust agents with the thread's file and shell access.

@@ -4,7 +4,6 @@ import * as Layer from "effect/Layer";
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
 import * as Stream from "effect/Stream";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
@@ -39,7 +38,7 @@ const makeRegistry = (now: (() => number) | undefined, httpServer = fakeHttpServ
     );
 
 it.effect(
-  "stores only a token hash, resolves the bearer token, and revokes by thread, announcing it",
+  "stores only a token hash, resolves the bearer token, and announces each credential it revokes",
   () =>
     Effect.gen(function* () {
       let timestamp = 1_000;
@@ -63,7 +62,16 @@ it.effect(
       const revocations = yield* registry.subscribeRevocations;
       yield* registry.revokeThread(threadId);
       expect(yield* registry.resolve(token)).toBeUndefined();
-      expect(Option.getOrUndefined(yield* Stream.runHead(revocations))).toEqual(resolved?.thread);
+      const other = yield* registry.issue({
+        threadId: ThreadId.make("thread-2"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(),
+      });
+      yield* registry.revokeProviderSession(other.config.providerSessionId);
+      expect(Array.from(yield* Stream.runCollect(Stream.take(revocations, 2)))).toEqual([
+        resolved?.thread,
+        expect.objectContaining({ providerSessionId: other.config.providerSessionId }),
+      ]);
 
       timestamp += 2_000;
     }),

@@ -26,6 +26,6 @@ export const layer = Layer.succeed(
     revokeThread: () => Effect.void,
     revokeAll: Effect.void,
     isIssued: () => Effect.succeed(true),
-    subscribeRevocations: Effect.succeed(Stream.empty),
+    subscribeRevocations: Effect.succeed(Stream.never),
   }),
 );

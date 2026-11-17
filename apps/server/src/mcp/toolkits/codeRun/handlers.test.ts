@@ -80,6 +80,7 @@ const call = Effect.fn("call")(function* (caller: {
         Effect.sync(() => (bound.push([scope.thread.providerSessionId, tool]), null)),
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
+      subscribeDomainEvents: Effect.succeed(Stream.never),
       getThreadShell: () => Effect.succeed(shell),
       getThreadRecords: (() =>
         Effect.succeed({
@@ -91,7 +92,18 @@ const call = Effect.fn("call")(function* (caller: {
     Layer.provide(
       Layer.mergeAll(
         layerDependencies,
-        ServerSettings.layerTest({ codeModeEnabled: caller.codeModeEnabled ?? true }),
+        // The test layer's changes end at once, which Code Mode reads as lost, so it refuses runs.
+        Layer.effect(
+          ServerSettings.ServerSettingsService,
+          Effect.map(ServerSettings.ServerSettingsService, (settings) => ({
+            ...settings,
+            subscribeChanges: Effect.succeed(Stream.never),
+          })),
+        ).pipe(
+          Layer.provide(
+            ServerSettings.layerTest({ codeModeEnabled: caller.codeModeEnabled ?? true }),
+          ),
+        ),
         Layer.succeed(HostProcess.Environment, environment),
         McpSessionRegistryTestkit.layer,
         Layer.succeed(HostProcess.Platform, caller.platform ?? "linux"),

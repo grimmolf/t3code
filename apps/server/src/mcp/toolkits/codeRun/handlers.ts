@@ -36,6 +36,7 @@ const handlers = {
         CodeModeCredentialEndedError: failure("thread_credential_required"),
         CodeModeSessionEndedError: failure("orchestration_error"),
         CodeModeFullError: failure("orchestration_error"),
+        CodeModeUnwatchedError: failure("orchestration_error"),
         CodeModeNoWorkspaceError: failure("thread_not_found"),
         CodeModeAskError: failure("orchestration_error"),
         CodeModeNotApprovedError: failure("capability_denied"),

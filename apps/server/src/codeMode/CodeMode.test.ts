@@ -32,9 +32,9 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
-import type * as Cause from "effect/Cause";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -339,7 +339,9 @@ const withCodeMode = <A, E, R>(
     readonly revoked?: ReadonlySet<string>;
     /** Each recorded session's process starts once this succeeds. */
     readonly starting?: Effect.Effect<void>;
-    readonly settingChanges?: Queue.Queue<ServerSettingsValue, Cause.Done>;
+    readonly settingChanges?: PubSub.PubSub<ServerSettingsValue>;
+    /** Ends the first subscription to `settingChanges` once it succeeds, as a lost one would. */
+    readonly dropSettings?: Effect.Effect<void>;
     /** Why each recorded session was ended. */
     readonly ended?: Array<string>;
     /** Receives the same reasons, for a test to wait on. */
@@ -349,6 +351,7 @@ const withCodeMode = <A, E, R>(
   } = {},
 ) => {
   const runs: Array<string> = [];
+  let settingSubscriptions = 0;
   const instance = {
     snapshot: {
       getSnapshot: Effect.succeed({
@@ -412,11 +415,17 @@ const withCodeMode = <A, E, R>(
               Effect.map(ServerSettings.ServerSettingsService, (settings) => ({
                 ...settings,
                 // The test layer's stream ends at once, which Code Mode reads as lost changes.
-                subscribeChanges: Effect.succeed(
+                subscribeChanges:
                   options.settingChanges === undefined
-                    ? Stream.never
-                    : Stream.fromQueue(options.settingChanges),
-                ),
+                    ? Effect.succeed(Stream.never)
+                    : PubSub.subscribe(options.settingChanges).pipe(
+                        Effect.map((subscription) => {
+                          const changes = Stream.fromSubscription(subscription);
+                          return settingSubscriptions++ === 0 && options.dropSettings !== undefined
+                            ? changes.pipe(Stream.interruptWhen(options.dropSettings))
+                            : changes;
+                        }),
+                      ),
               })),
             ),
           ),
@@ -1040,7 +1049,8 @@ it.effect(
       // Code Mode hears of the raced thread's mode change, and every later event, only once released.
       const holdRaced = (threads: Threads): Threads => ({
         ...threads,
-        streamDomainEvents: threads.streamDomainEvents.pipe(
+        subscribeDomainEvents: Effect.map(
+          threads.subscribeDomainEvents,
           Stream.mapEffect((event) =>
             event.threadId === racedId && event.type === "thread.runtime-mode-updated"
               ? Deferred.await(releaseRaced).pipe(Effect.as(event))
@@ -1109,14 +1119,17 @@ it.effect(
 );
 
 it.effect(
-  "stops a running evaluation when its turn ends, the mode changes, the thread is archived, Code Mode is turned off, or T3 stops hearing about those changes",
+  "stops a running evaluation when its turn ends, the mode changes, the thread is archived, Code Mode is turned off, or T3 stops hearing about those changes, and starts none until it hears them again",
   () =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
-      const settingChanges = yield* Queue.unbounded<ServerSettingsValue, Cause.Done>();
+      const settingChanges = yield* PubSub.unbounded<ServerSettingsValue>();
+      const dropSettings = yield* Deferred.make<void>();
       const withEvents = (threads: Threads): Threads => ({
         ...threads,
-        streamDomainEvents: Stream.merge(threads.streamDomainEvents, Stream.fromQueue(events)),
+        subscribeDomainEvents: Effect.map(threads.subscribeDomainEvents, (stream) =>
+          Stream.merge(stream, Stream.fromQueue(events)),
+        ),
       });
       yield* withCodeMode(
         (codeMode) =>
@@ -1216,32 +1229,64 @@ it.effect(
             });
 
             const off = yield* startTurn("turned-off", "full-access", instanceId, cwd);
-            const turnOff = yield* stoppedBy(
-              off.threadId,
-              settings.getSettings.pipe(
-                Effect.flatMap((current) =>
-                  Queue.offer(settingChanges, { ...current, codeModeEnabled: false }),
-                ),
+            const publishOff = settings.getSettings.pipe(
+              Effect.flatMap((current) =>
+                PubSub.publish(settingChanges, { ...current, codeModeEnabled: false }),
               ),
             );
-            assert.deepEqual(sessionOf(turnOff.next), {
+            const turnedOff = {
               status: "done",
               result: "undefined",
               sessionStarted: true,
               notice: "Code Mode was turned off, so every session ended.",
-            });
+            } as const;
+            assert.deepEqual(
+              sessionOf((yield* stoppedBy(off.threadId, publishOff)).next),
+              turnedOff,
+            );
 
-            // Last: the setting watcher then keeps finding its stream ended.
+            // T3 loses setting changes once, and subscribes again a second later.
             const lost = yield* startTurn("watch-lost", "full-access", instanceId, cwd);
-            const lostWatch = yield* stoppedBy(lost.threadId, Queue.end(settingChanges));
-            assert.deepEqual(sessionOf(lostWatch.next), {
+            const held = yield* holding();
+            const lostRun = yield* runScript(codeMode, lost.threadId, "await t3.hold();", {
+              bindings: held.bindings,
+            }).pipe(Effect.forkChild);
+            yield* held.called;
+            yield* Deferred.succeed(dropSettings, undefined);
+            yield* held.stopped;
+            const unwatched =
+              "T3 lost track of the changes that end sessions, so every session ended.";
+            assert.equal((yield* Fiber.join(lostRun)).error, unwatched);
+            // Until then a new session could miss the change that should end it, so none starts.
+            assert.equal(
+              refusal(yield* Effect.exit(runScript(codeMode, lost.threadId, "return 1"))),
+              "CodeModeUnwatchedError",
+            );
+            // Nothing hears this, so later calls must find it in the setting itself.
+            yield* settings.updateSettings({ codeModeEnabled: false });
+            yield* TestClock.adjust(Duration.seconds(1));
+            assert.equal(
+              refusal(yield* Effect.exit(runScript(codeMode, lost.threadId, "return 1"))),
+              "CodeModeOffError",
+            );
+            yield* settings.updateSettings({ codeModeEnabled: true });
+            assert.deepEqual(sessionOf(yield* runScript(codeMode, lost.threadId, "return 1")), {
               status: "done",
-              result: "undefined",
+              result: 1,
               sessionStarted: true,
-              notice: "T3 lost track of the changes that end sessions, so every session ended.",
+              notice: unwatched,
             });
+            assert.deepEqual(
+              sessionOf((yield* stoppedBy(lost.threadId, publishOff)).next),
+              turnedOff,
+            );
           }),
-        { realRunner: true, threads: withEvents, settingChanges },
+        {
+          realRunner: true,
+          threads: withEvents,
+          settingChanges,
+          dropSettings: Deferred.await(dropSettings),
+        },
       );
     }).pipe(Effect.provide(layerTest)),
 );

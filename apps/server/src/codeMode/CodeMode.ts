@@ -163,6 +163,15 @@ export const SESSION_LIMIT = 16;
 // read the last evaluation's output.
 const NOTICE_LIMIT = 4 * SESSION_LIMIT;
 
+export class CodeModeUnwatchedError extends Schema.TaggedError<CodeModeUnwatchedError>()(
+  "CodeModeUnwatchedError",
+  {},
+) {
+  override get message(): string {
+    return "T3 lost track of the changes that end JavaScript sessions and is reconnecting, so the script did not run. Try again in a few seconds.";
+  }
+}
+
 export class CodeModeFullError extends Schema.TaggedError<CodeModeFullError>()(
   "CodeModeFullError",
   {},
@@ -238,6 +247,7 @@ export class CodeMode extends Context.Service<
       | CodeModeCredentialEndedError
       | CodeModeSessionEndedError
       | CodeModeFullError
+      | CodeModeUnwatchedError
       | CodeModeNoWorkspaceError
       | CodeModeAskError
       | CodeModeNotApprovedError
@@ -316,6 +326,8 @@ const make = Effect.gen(function* () {
   const sessions = new Map<ThreadId, Session>();
   const endings = new Map<ThreadId, Ending>();
   const sessionLocks = yield* KeyedLock.make<ThreadId>();
+  /** Watchers not subscribed now. While any is down, no session starts, as it could miss its end. */
+  const unwatched = new Set<string>();
 
   // Read per call, so turning the setting off refuses the next call.
   const offered =
@@ -404,6 +416,7 @@ const make = Effect.gen(function* () {
   /** What the thread allows now, judged by the provider its running turn is on. */
   const permit = Effect.fn("CodeMode.permit")(function* (threadId: ThreadId) {
     if (!(yield* offered)) return yield* new CodeModeOffError();
+    if (unwatched.size > 0) return yield* new CodeModeUnwatchedError();
     const shell = yield* threads.getThreadShell(threadId).pipe(Effect.orElseSucceed(() => null));
     if (shell === null) return yield* new CodeModeNoWorkspaceError({ threadId });
     const running = yield* threads
@@ -454,9 +467,11 @@ const make = Effect.gen(function* () {
     );
 
   const endAll = (reason: string) =>
-    Effect.forEach(Array.from(sessions.values()), (session) => end(session, reason), {
-      discard: true,
-    });
+    Effect.suspend(() =>
+      Effect.forEach(Array.from(sessions.values()), (session) => end(session, reason), {
+        discard: true,
+      }),
+    );
 
   const touch = (session: Session) => {
     if (sessions.get(session.threadId) !== session) return;
@@ -482,7 +497,9 @@ const make = Effect.gen(function* () {
    * limit. When every place is taken, the least recently used idle session gives up its own.
    */
   const claim = (session: Session) =>
-    Effect.suspend(() => {
+    Effect.suspend((): Effect.Effect<void, CodeModeFullError | CodeModeUnwatchedError> => {
+      // Checked again as the place is taken, since a watcher lost after `permit` ended every session.
+      if (unwatched.size > 0) return Effect.fail(new CodeModeUnwatchedError());
       let evicted: Session | undefined;
       if (sessions.size >= SESSION_LIMIT) {
         evicted = Array.from(sessions.values()).find(
@@ -825,46 +842,55 @@ const make = Effect.gen(function* () {
     });
 
   /**
-   * Keeps a watcher subscribed. A watcher that stopped may have missed an event that ends a
-   * session, so every session ends before it subscribes again.
+   * Keeps a watcher subscribed. One that stops may have missed an event that ends a session, so
+   * every session ends, and none starts until it subscribes again. A session therefore exists only
+   * while every watcher has been subscribed since it started.
    */
-  const keepWatching = <E>(what: string, watcher: Effect.Effect<void, E, Scope.Scope>) =>
-    Effect.scoped(watcher).pipe(
+  const keepWatching = <A, E1, E2>(
+    what: string,
+    subscribe: Effect.Effect<Stream.Stream<A, E1>, E2, Scope.Scope>,
+    onItem: (item: A) => Effect.Effect<void>,
+  ) => {
+    unwatched.add(what);
+    const tried = Deferred.makeUnsafe<void>();
+    return Effect.scoped(
+      Effect.flatMap(subscribe, (items) => {
+        unwatched.delete(what);
+        Deferred.doneUnsafe(tried, Effect.void);
+        return Stream.runForEach(items, onItem);
+      }),
+    ).pipe(
       Effect.andThen(Effect.fail(`${what} ended`)),
       Effect.sandbox,
       Effect.tapError((cause) =>
-        Effect.logWarning(`Code Mode lost ${what}`, { cause: Cause.pretty(cause) }).pipe(
-          Effect.andThen(endAll(ENDED.unwatched)),
+        Effect.suspend(() => {
+          unwatched.add(what);
+          Deferred.doneUnsafe(tried, Effect.void);
+          return endAll(ENDED.unwatched);
+        }).pipe(
+          Effect.andThen(
+            Effect.logWarning(`Code Mode lost ${what}`, { cause: Cause.pretty(cause) }),
+          ),
         ),
       ),
       Effect.retry(Schedule.spaced(Duration.seconds(1))),
       Effect.forkScoped({ startImmediately: true }),
+      // Code Mode takes calls once each watcher has tried, so it refuses none at startup.
+      Effect.andThen(Deferred.await(tried)),
     );
+  };
 
-  yield* keepWatching(
-    "the thread event stream",
-    Stream.runForEach(threads.streamDomainEvents, onEvent),
+  yield* keepWatching("the thread event stream", threads.subscribeDomainEvents, onEvent);
+  yield* keepWatching("credential revocations", registry.subscribeRevocations, (caller) =>
+    Effect.suspend(() => {
+      const session = sessions.get(caller.threadId);
+      return session !== undefined && session.providerSessionId === caller.providerSessionId
+        ? end(session, ENDED.revoked)
+        : Effect.void;
+    }),
   );
-  yield* keepWatching(
-    "credential revocations",
-    Effect.flatMap(registry.subscribeRevocations, (revocations) =>
-      Stream.runForEach(revocations, (caller) =>
-        Effect.suspend(() => {
-          const session = sessions.get(caller.threadId);
-          return session !== undefined && session.providerSessionId === caller.providerSessionId
-            ? end(session, ENDED.revoked)
-            : Effect.void;
-        }),
-      ),
-    ),
-  );
-  yield* keepWatching(
-    "setting changes",
-    Effect.flatMap(settings.subscribeChanges, (changes) =>
-      Stream.runForEach(changes, (next) =>
-        next.codeModeEnabled ? Effect.void : endAll(ENDED.off),
-      ),
-    ),
+  yield* keepWatching("setting changes", settings.subscribeChanges, (next) =>
+    next.codeModeEnabled ? Effect.void : endAll(ENDED.off),
   );
 
   return CodeMode.of({ offered, run, poll, reset });

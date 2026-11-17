@@ -157,6 +157,22 @@ it.layer(layerTest)("CodeRunner", (it) => {
     }),
   );
 
+  it.effect("awaits fs calls, and lets a script declare its own fs", () =>
+    Effect.gen(function* () {
+      const cwd = yield* workspace();
+      const awaited = yield* run(
+        `await fs.writeFile("note.txt", "hi"); return await fs.readFile("note.txt", "utf8");`,
+        { cwd },
+      );
+      expect(awaited).toMatchObject({ result: "hi", error: null });
+      const redeclared = yield* run(
+        `const fs = require("node:fs"); return fs.readFileSync("note.txt", "utf8");`,
+        { cwd },
+      );
+      expect(redeclared).toMatchObject({ result: "hi", error: null });
+    }),
+  );
+
   it.effect("stops a script at the timeout and kills what it started", () =>
     Effect.gen(function* () {
       const report = yield* pidReport();

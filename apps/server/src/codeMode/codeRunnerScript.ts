@@ -97,8 +97,11 @@ const flush = (stream) => new Promise((resolve) => stream.write("", resolve));
   let message;
   try {
     const AsyncFunction = (async () => {}).constructor;
-    const script = new AsyncFunction("$", "edit", "require", "fs", code);
-    const value = await script($, edit, createRequire(path.join(process.cwd(), "t3-code-run.js")), fs);
+    // An inner function lets the script declare its own fs, $, edit or require.
+    const script = new AsyncFunction("$", "edit", "require", "fs", "return (async () => {\n" + code + "\n})();");
+    // Promise forms of the async calls, so await fs.readFile works; sync calls stay as they are.
+    const scriptFs = Object.create(fs, Object.getOwnPropertyDescriptors(fs.promises));
+    const value = await script($, edit, createRequire(path.join(process.cwd(), "t3-code-run.js")), scriptFs);
     let json;
     try {
       json = JSON.stringify(value);

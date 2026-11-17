@@ -25,6 +25,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpSessionRegistryTestkit from "../../McpSessionRegistry.testkit.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { liveThreadShell } from "../../McpToolAccess.testkit.ts";
+import * as CodeRunBindings from "./bindings.ts";
 import * as CodeRunHandlers from "./handlers.ts";
 import { CodeRunToolkit } from "./tools.ts";
 
@@ -49,7 +50,10 @@ const call = Effect.fn("call")(function* (caller: {
   readonly platform?: NodeJS.Platform;
   readonly code?: string;
 }) {
-  const runs: Array<CodeRunner.CodeSessionInput & { readonly code: string }> = [];
+  const runs: Array<
+    CodeRunner.CodeSessionInput & { readonly code: string; readonly tools: ReadonlyArray<string> }
+  > = [];
+  const bound: Array<[string | undefined, string]> = [];
   const shell = { ...liveThreadShell(threadId), projectId: ProjectId.make("project:acme") };
   const layerDependencies = Layer.mergeAll(
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
@@ -69,6 +73,11 @@ const call = Effect.fn("call")(function* (caller: {
           : undefined,
       capabilities: new Set(["orchestration" as const]),
       issuedAt: 0,
+    }),
+    Layer.mock(CodeRunBindings.CodeRunBindings)({
+      tools: ["t3_thread_list"],
+      call: (scope, tool) =>
+        Effect.sync(() => (bound.push([scope.thread.providerSessionId, tool]), null)),
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
       getThreadShell: () => Effect.succeed(shell),
@@ -95,7 +104,11 @@ const call = Effect.fn("call")(function* (caller: {
         Layer.mock(CodeRunner.CodeRunner)({
           start: (input) =>
             Effect.succeed({
-              evaluate: ({ code }) => Effect.sync(() => (runs.push({ ...input, code }), ran)),
+              evaluate: ({ code, tools, call }) =>
+                call("t3_thread_list", {}).pipe(
+                  Effect.orDie,
+                  Effect.as((runs.push({ ...input, code, tools }), ran)),
+                ),
               end: () => Effect.void,
               ended: Effect.never,
               hasEnded: Effect.succeed(false),
@@ -118,19 +131,22 @@ const call = Effect.fn("call")(function* (caller: {
       ),
     ),
   );
-  return { result, runs };
+  return { result, runs, bound };
 });
 
 it.effect("runs a thread's script in its workspace with the server's environment", () =>
   Effect.gen(function* () {
-    const { result, runs } = yield* call({});
+    const { result, runs, bound } = yield* call({});
     expect(result).toEqual({
       handle: expect.any(String),
       status: "done",
       ...ran,
       sessionStarted: true,
     });
-    expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment }]);
+    expect(runs).toEqual([
+      { code: "return 12", cwd: "/home/user/acme", environment, tools: ["t3_thread_list"] },
+    ]);
+    expect(bound).toEqual([["provider:code-run", "t3_thread_list"]]);
   }),
 );
 

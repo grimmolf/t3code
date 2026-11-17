@@ -3,9 +3,9 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 
 import * as CodeMode from "../../../codeMode/CodeMode.ts";
-import { CodeToolCallError } from "../../../codeMode/CodeRunner.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
+import * as CodeRunBindings from "./bindings.ts";
 import { CodeRunToolkit } from "./tools.ts";
 
 const failure = (code: OrchestratorMcpFailure["code"]) => (error: { readonly message: string }) =>
@@ -16,22 +16,17 @@ const threadCaller = (operation: string) =>
     Effect.flatMap((scope) => McpInvocationContext.requireThreadScope(scope, operation)),
   );
 
-const noBindings: CodeMode.CodeModeBindings = {
-  tools: [],
-  call: (tool) =>
-    Effect.fail(new CodeToolCallError({ reason: `t3.${tool} is not available to scripts.` })),
-};
-
 const handlers = {
   t3_code_run: McpToolAccess.actsAsCaller(({ code }) =>
     Effect.gen(function* () {
-      const { thread } = yield* threadCaller("t3_code_run");
+      const scope = yield* threadCaller("t3_code_run");
+      const bindings = yield* CodeRunBindings.CodeRunBindings;
       const codeMode = yield* CodeMode.CodeMode;
       return yield* codeMode.run({
-        threadId: thread.threadId,
-        providerSessionId: thread.providerSessionId,
+        threadId: scope.thread.threadId,
+        providerSessionId: scope.thread.providerSessionId,
         code,
-        bindings: noBindings,
+        bindings: { tools: bindings.tools, call: (tool, args) => bindings.call(scope, tool, args) },
       });
     }).pipe(
       Effect.catchTags({

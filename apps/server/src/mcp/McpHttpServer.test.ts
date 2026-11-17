@@ -33,6 +33,7 @@ import { HttpBody, HttpClient, HttpClientRequest, HttpRouter, HttpServer } from 
 import * as NetAddress from "effect/net/NetAddress";
 
 import * as CodeMode from "../codeMode/CodeMode.ts";
+import * as CodeRunBindings from "./toolkits/codeRun/bindings.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
 import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts";
@@ -1978,7 +1979,9 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
             }),
           ),
           McpHttpServer.layerToolSearch,
-          McpHttpServer.layerCodeRunToolkit,
+          McpHttpServer.layerCodeRunToolkit.pipe(
+            Layer.provide(Layer.mock(CodeRunBindings.CodeRunBindings)({ tools: [] })),
+          ),
         ),
       ).pipe(
         Layer.provide(ServerSettings.layerTest()),
@@ -2095,7 +2098,11 @@ it.effect("interrupts a running t3_code_run when the provider cancels the call o
       const started = yield* Deferred.make<void>();
       const interrupted = yield* Deferred.make<void>();
       const runs = { started, interrupted };
-      const serverLayer = McpHttpServer.layerMcpTransport(McpHttpServer.layerCodeRunToolkit).pipe(
+      const serverLayer = McpHttpServer.layerMcpTransport(
+        McpHttpServer.layerCodeRunToolkit.pipe(
+          Layer.provide(Layer.mock(CodeRunBindings.CodeRunBindings)({ tools: [] })),
+        ),
+      ).pipe(
         Layer.provide(ServerSettings.layerTest()),
         Layer.provide(
           Layer.mock(ThreadManagementService.ThreadManagementService)({
@@ -2207,7 +2214,11 @@ it.effect(
           issuedAt: 1,
         };
         const codeModeOn = yield* Ref.make(true);
-        const serverLayer = McpHttpServer.layerMcpTransport(McpHttpServer.layerCodeRunToolkit).pipe(
+        const serverLayer = McpHttpServer.layerMcpTransport(
+          McpHttpServer.layerCodeRunToolkit.pipe(
+            Layer.provide(Layer.mock(CodeRunBindings.CodeRunBindings)({ tools: [] })),
+          ),
+        ).pipe(
           Layer.provide(ServerSettings.layerTest()),
           Layer.provide(McpToolAccessTestkit.liveThreadsLayer),
           Layer.provide(Layer.mock(CodeMode.CodeMode)({ offered: Ref.get(codeModeOn) })),

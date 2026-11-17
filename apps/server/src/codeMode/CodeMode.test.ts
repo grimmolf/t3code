@@ -1031,14 +1031,45 @@ it.effect("refuses a script whose credential ends while it waits for approval or
 );
 
 it.effect(
-  "ends an idle session when the thread's mode changes, but not for an unchanged mode",
+  "ends an idle session when the thread's mode changes, even before its event arrives, but not for an unchanged mode",
   () =>
     Effect.gen(function* () {
       const endings = yield* Queue.unbounded<string>();
+      const racedId = ThreadId.make("thread:mode-raced");
+      const releaseRaced = yield* Deferred.make<void>();
+      // Code Mode hears of the raced thread's mode change, and every later event, only once released.
+      const holdRaced = (threads: Threads): Threads => ({
+        ...threads,
+        streamDomainEvents: threads.streamDomainEvents.pipe(
+          Stream.mapEffect((event) =>
+            event.threadId === racedId && event.type === "thread.runtime-mode-updated"
+              ? Deferred.await(releaseRaced).pipe(Effect.as(event))
+              : Effect.succeed(event),
+          ),
+        ),
+      });
       yield* withCodeMode(
         (codeMode) =>
           Effect.gen(function* () {
             const threads = yield* ThreadManagementService.ThreadManagementService;
+            const modeChanged = "The thread's mode changed, so its session ended.";
+            const raced = yield* startTurn("mode-raced", "full-access");
+            yield* runScript(codeMode, raced.threadId, "return 1");
+            yield* threads.dispatch({
+              type: "thread.runtime-mode.set",
+              commandId: CommandId.make("mode:raced"),
+              threadId: raced.threadId,
+              runtimeMode: "auto",
+            });
+            assert.deepEqual(sessionOf(yield* runScript(codeMode, raced.threadId, "return 1")), {
+              status: "done",
+              result: null,
+              sessionStarted: true,
+              notice: modeChanged,
+            });
+            assert.equal(yield* Queue.take(endings), modeChanged);
+            yield* Deferred.succeed(releaseRaced, undefined);
+
             const unchanged = yield* startTurn("mode-unchanged", "full-access");
             const changed = yield* startTurn("mode-changed-idle", "full-access");
             yield* runScript(codeMode, unchanged.threadId, "return 1");
@@ -1056,14 +1087,15 @@ it.effect(
               threadId: changed.threadId,
               runtimeMode: "auto",
             });
-            const modeChanged = "The thread's mode changed, so its session ended.";
-            // Events arrive in order, so the unchanged thread's event has been handled too.
+            // Events arrive in order, so the raced and unchanged threads' events were handled too.
             assert.equal(yield* Queue.take(endings), modeChanged);
 
-            assert.equal(
-              (yield* runScript(codeMode, unchanged.threadId, "return 1")).sessionStarted,
-              undefined,
-            );
+            for (const threadId of [raced.threadId, unchanged.threadId]) {
+              assert.equal(
+                (yield* runScript(codeMode, threadId, "return 1")).sessionStarted,
+                undefined,
+              );
+            }
             assert.deepEqual(sessionOf(yield* runScript(codeMode, changed.threadId, "return 1")), {
               status: "done",
               result: null,
@@ -1071,7 +1103,7 @@ it.effect(
               notice: modeChanged,
             });
           }),
-        { endings },
+        { endings, threads: holdRaced },
       );
     }).pipe(Effect.provide(layerTest)),
 );

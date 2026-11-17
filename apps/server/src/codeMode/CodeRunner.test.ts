@@ -29,14 +29,12 @@ const session = Effect.fn("session")(function* (
   options: {
     readonly cwd?: string;
     readonly environment?: NodeJS.ProcessEnv;
-    readonly tools?: ReadonlyArray<string>;
   } = {},
 ) {
   const runner = yield* CodeRunner.CodeRunner;
   return yield* runner.start({
     cwd: options.cwd ?? (yield* workspace()),
     environment: options.environment ?? { PATH: (yield* HostProcess.Environment).PATH },
-    tools: options.tools ?? [],
   });
 });
 
@@ -46,7 +44,9 @@ const run = (
   options: { readonly cwd?: string; readonly environment?: NodeJS.ProcessEnv } = {},
 ) =>
   Effect.scoped(
-    Effect.flatMap(session(options), (started) => started.evaluate({ code, call: noCalls })),
+    Effect.flatMap(session(options), (started) =>
+      started.evaluate({ code, tools: [], call: noCalls }),
+    ),
   );
 
 const isRunning = (pid: number) => {
@@ -192,7 +192,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
       const report = yield* pidReport();
       const started = yield* session();
       const fiber = yield* started
-        .evaluate({ code: report.script, call: noCalls })
+        .evaluate({ code: report.script, tools: [], call: noCalls })
         .pipe(Effect.forkChild);
       const pid = yield* report.pid;
       expect(isRunning(pid)).toBe(true);
@@ -213,7 +213,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
       );
       const started = yield* session();
       const fiber = yield* started
-        .evaluate({ code: report.script, call: noCalls })
+        .evaluate({ code: report.script, tools: [], call: noCalls })
         .pipe(Effect.forkChild);
       const pid = yield* report.pid;
       yield* Effect.addFinalizer(() => Effect.sync(() => isRunning(pid) && process.kill(pid)));
@@ -233,7 +233,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
       const report = yield* pidReport();
       const started = yield* session();
       const fiber = yield* started
-        .evaluate({ code: report.script, call: noCalls })
+        .evaluate({ code: report.script, tools: [], call: noCalls })
         .pipe(Effect.forkChild);
       const pid = yield* report.pid;
 
@@ -271,7 +271,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
     it.effect("keeps globalThis between evaluations, and each one's own output", () =>
       Effect.gen(function* () {
         const started = yield* session();
-        const evaluate = (code: string) => started.evaluate({ code, call: noCalls });
+        const evaluate = (code: string) => started.evaluate({ code, tools: [], call: noCalls });
 
         const first = yield* evaluate(
           `globalThis.kept = 1; var local = 2; let block = 3; function helper() {} console.log("one");`,
@@ -295,9 +295,10 @@ it.layer(layerTest)("CodeRunner", (it) => {
 
     it.effect("lists its tools, calls them, and throws their failures", () =>
       Effect.gen(function* () {
-        const started = yield* session({ tools });
+        const started = yield* session();
         const calls: Array<[string, unknown]> = [];
         const output = yield* started.evaluate({
+          tools,
           code: [
             "const threads = await t3.t3_thread_list({ limit: 2 });",
             "const failure = await t3.t3_thread_read({ threadId: 'gone' }).catch((error) => [error.message, error.code, error.tool]);",
@@ -335,15 +336,17 @@ it.layer(layerTest)("CodeRunner", (it) => {
 
     it.effect("refuses a call from a callback of an evaluation that has finished", () =>
       Effect.gen(function* () {
-        const started = yield* session({ tools });
+        const started = yield* session();
         const calls: Array<string> = [];
         const call: CodeRunner.EvaluateInput["call"] = (tool) =>
           Effect.sync(() => (calls.push(tool), null));
         yield* started.evaluate({
+          tools,
           code: "globalThis.ticked = new Promise((resolve) => setInterval(() => { if (globalThis.armed) t3.t3_thread_list({}).then(() => resolve('ran'), (error) => resolve(error.message)); }, 5));",
           call,
         });
         const output = yield* started.evaluate({
+          tools,
           code: "globalThis.armed = true; return await ticked;",
           call,
         });
@@ -357,8 +360,9 @@ it.layer(layerTest)("CodeRunner", (it) => {
 
     it.effect("runs at most 8 calls at once in one evaluation", () =>
       Effect.gen(function* () {
-        const started = yield* session({ tools });
+        const started = yield* session();
         const output = yield* started.evaluate({
+          tools,
           code: [
             "const calls = Array.from({ length: 9 }, () => t3.t3_thread_list({}));",
             "return await calls[8].then(() => 'ran', (error) => error.message);",

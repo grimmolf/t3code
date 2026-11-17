@@ -22,6 +22,7 @@ import * as ProjectService from "../../../project/ProjectService.ts";
 import * as ProviderInstanceRegistry from "../../../provider/ProviderInstanceRegistry.ts";
 import * as ServerSettings from "../../../serverSettings.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
+import * as McpSessionRegistryTestkit from "../../McpSessionRegistry.testkit.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import { liveThreadShell } from "../../McpToolAccess.testkit.ts";
 import * as CodeRunHandlers from "./handlers.ts";
@@ -83,6 +84,7 @@ const call = Effect.fn("call")(function* (caller: {
         layerDependencies,
         ServerSettings.layerTest({ codeModeEnabled: caller.codeModeEnabled ?? true }),
         Layer.succeed(HostProcess.Environment, environment),
+        McpSessionRegistryTestkit.layer,
         Layer.succeed(HostProcess.Platform, caller.platform ?? "linux"),
         Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
           getInstance: () => Effect.succeed(instance),
@@ -96,6 +98,7 @@ const call = Effect.fn("call")(function* (caller: {
               evaluate: ({ code }) => Effect.sync(() => (runs.push({ ...input, code }), ran)),
               end: () => Effect.void,
               ended: Effect.never,
+              hasEnded: Effect.succeed(false),
             }),
         }),
       ),
@@ -121,8 +124,13 @@ const call = Effect.fn("call")(function* (caller: {
 it.effect("runs a thread's script in its workspace with the server's environment", () =>
   Effect.gen(function* () {
     const { result, runs } = yield* call({});
-    expect(result).toEqual(ran);
-    expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment, tools: [] }]);
+    expect(result).toEqual({
+      handle: expect.any(String),
+      status: "done",
+      ...ran,
+      sessionStarted: true,
+    });
+    expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment }]);
   }),
 );
 

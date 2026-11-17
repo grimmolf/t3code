@@ -5,7 +5,7 @@ import * as Schema from "effect/Schema";
 import { McpSchema, Tool, Toolkit } from "effect/ai";
 
 import * as CodeMode from "../../../codeMode/CodeMode.ts";
-import { CodeRunOutput, RESPONSE_LIMIT_BYTES, RUN_TIMEOUT } from "../../../codeMode/CodeRunner.ts";
+import { RESPONSE_LIMIT_BYTES, RUN_TIMEOUT } from "../../../codeMode/CodeRunner.ts";
 import * as ThreadManagementService from "../../../orchestration-v2/ThreadManagementService.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
@@ -33,7 +33,7 @@ const CodeRunTool = Tool.make(T3_CODE_RUN_TOOL_NAME, {
       }),
     ),
   }),
-  success: CodeRunOutput,
+  success: CodeMode.CodeRunResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
   dependencies: [

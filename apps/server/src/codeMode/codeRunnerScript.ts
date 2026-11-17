@@ -2,7 +2,7 @@
  * Runs as `node -e` in its own process group, one per session. It reads JSON lines from fd 4
  * (`evaluate`, `reply`) and writes JSON lines to fd 3 (`result`, `call`). Each evaluation ends
  * by writing its marker to stdout and stderr, then its result. It exits when fd 4 closes.
- * `process.argv[1]` is the JSON list of `t3` tool names. No `${` below: this is a template literal.
+ * No `${` below: this is a template literal.
  */
 export const CODE_RUNNER_SCRIPT = String.raw`"use strict";
 delete process.env.ELECTRON_RUN_AS_NODE;
@@ -118,13 +118,13 @@ const call = (tool, args) => {
   });
 };
 
-const toolNames = JSON.parse(process.argv[1] ?? "[]");
-const t3 = Object.freeze(
-  Object.fromEntries([
-    ["tools", () => [...toolNames]],
-    ...toolNames.map((name) => [name, (args) => call(name, args)]),
-  ]),
-);
+const toolsOf = (names) =>
+  Object.freeze(
+    Object.fromEntries([
+      ["tools", () => [...names]],
+      ...names.map((name) => [name, (args) => call(name, args)]),
+    ]),
+  );
 
 const AsyncFunction = (async () => {}).constructor;
 // Promise forms of the async calls, so await fs.readFile works; sync calls stay as they are.
@@ -132,12 +132,12 @@ const scriptFs = Object.create(fs, Object.getOwnPropertyDescriptors(fs.promises)
 const scriptRequire = createRequire(path.join(process.cwd(), "t3-code-run.js"));
 const cut = (text) => (text.length > RESULT_LIMIT ? { text: text.slice(0, RESULT_LIMIT), cut: true } : { text, cut: false });
 
-const evaluate = async ({ id, code, marker }) => {
+const evaluate = async ({ id, code, marker, tools }) => {
   let message;
   try {
     // An inner function lets the script declare its own fs, $, edit, require or t3.
     const script = new AsyncFunction("$", "edit", "require", "fs", "t3", "return (async () => {\n" + code + "\n})();");
-    const value = await evaluation.run(id, () => script($, edit, scriptRequire, scriptFs, t3));
+    const value = await evaluation.run(id, () => script($, edit, scriptRequire, scriptFs, toolsOf(tools)));
     let json;
     try {
       json = JSON.stringify(value);

@@ -52,12 +52,12 @@ export interface CodeSessionInput {
   /** Relative paths in scripts resolve against it. */
   readonly cwd: string;
   readonly environment: NodeJS.ProcessEnv;
-  /** The names scripts can call as `t3.<name>(args)`. */
-  readonly tools: ReadonlyArray<string>;
 }
 
 export interface EvaluateInput {
   readonly code: string;
+  /** The names this evaluation can call as `t3.<name>(args)`. */
+  readonly tools: ReadonlyArray<string>;
   /** Answers this evaluation's `t3.<tool>(args)` calls. */
   readonly call: (tool: string, args: Schema.Json) => Effect.Effect<Schema.Json, CodeToolCallError>;
 }
@@ -69,6 +69,7 @@ export interface CodeSession {
   readonly end: (reason: string) => Effect.Effect<void>;
   /** Succeeds with why, once the session's process has exited. */
   readonly ended: Effect.Effect<string>;
+  readonly hasEnded: Effect.Effect<boolean>;
 }
 
 export class CodeRunner extends Context.Service<
@@ -211,6 +212,7 @@ const ToChild = Schema.Union([
     id: Schema.String,
     code: Schema.String,
     marker: Schema.String,
+    tools: Schema.Array(Schema.String),
   }),
   Schema.Struct({
     type: Schema.Literal("reply"),
@@ -227,12 +229,9 @@ const ToChild = Schema.Union([
   }),
 ]);
 const encodeToChildJson = Schema.encodeEffect(Schema.fromJsonString(ToChild));
-const encodeToolNamesJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Schema.String)));
 // Every value here is already JSON, so encoding cannot fail.
 const encodeToChild = (message: typeof ToChild.Type) =>
   encodeToChildJson(message).pipe(Effect.orDie);
-const encodeToolNames = (tools: ReadonlyArray<string>) =>
-  encodeToolNamesJson(tools).pipe(Effect.orDie);
 
 interface Settled {
   readonly resultJson: string | null;
@@ -315,14 +314,13 @@ const make = Effect.gen(function* () {
     for (const [name, value] of Object.entries(input.environment)) {
       if (!isServerOnlyVariable(name)) environment[name] = value;
     }
-    const toolNames = yield* encodeToolNames(input.tools);
     const toChild = yield* Queue.unbounded<string>();
     const encoder = new TextEncoder();
     const handle = yield* spawner
       .spawn(
         ChildProcess.make(
           executablePath,
-          [`--max-old-space-size=${SESSION_HEAP_MIB}`, "-e", CODE_RUNNER_SCRIPT, toolNames],
+          [`--max-old-space-size=${SESSION_HEAP_MIB}`, "-e", CODE_RUNNER_SCRIPT],
           {
             cwd: input.cwd,
             env: environment,
@@ -513,7 +511,13 @@ const make = Effect.gen(function* () {
       current = running;
       stdout.install(running.stdout);
       stderr.install(running.stderr);
-      yield* send({ type: "evaluate", id, code: evaluation.code, marker: running.stdout.marker });
+      yield* send({
+        type: "evaluate",
+        id,
+        code: evaluation.code,
+        marker: running.stdout.marker,
+        tools: evaluation.tools,
+      });
       const outcome = yield* Deferred.await(running.settled).pipe(
         Effect.asSome,
         Effect.raceFirst(Deferred.await(exited).pipe(Effect.as(Option.none<Settled>()))),
@@ -565,6 +569,7 @@ const make = Effect.gen(function* () {
       evaluate,
       end,
       ended: Deferred.await(exited),
+      hasEnded: Deferred.isDone(exited),
     } satisfies CodeSession;
   });
 

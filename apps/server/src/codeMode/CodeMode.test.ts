@@ -1,3 +1,4 @@
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -16,6 +17,7 @@ import {
   type RuntimeMode,
   type RuntimeRequestId,
   type ServerProvider,
+  type ServerSettings as ServerSettingsValue,
   ThreadId,
 } from "@t3tools/contracts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
@@ -23,11 +25,14 @@ import type { ProviderInstance } from "@t3tools/provider-core/server/driver";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -41,6 +46,8 @@ import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderRuntimeRecoveryService from "../orchestration-v2/ProviderRuntimeRecoveryService.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
+import type * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
+import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as ProviderReplayHarness from "../orchestration-v2/testkit/ProviderReplayHarness.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -85,6 +92,7 @@ const startTurn = Effect.fn("startTurn")(function* (
   name: string,
   runtimeMode: RuntimeMode = "approval-required",
   runInstanceId: ProviderInstanceId = instanceId,
+  worktreePath = "/repo",
 ) {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
@@ -105,7 +113,7 @@ const startTurn = Effect.fn("startTurn")(function* (
     runtimeMode,
     interactionMode: "default",
     branch: null,
-    worktreePath: "/repo",
+    worktreePath,
     createdBy: "user",
     creationSource: "web",
   });
@@ -275,12 +283,60 @@ const startNextRun = Effect.fn("startNextRun")(function* (threadId: ThreadId, na
 
 type Threads = ThreadManagementService.ThreadManagementService["Service"];
 
+const credential = "credential:code-mode";
+const noBindings: CodeMode.CodeModeBindings = {
+  tools: [],
+  call: () => Effect.die("This script makes no t3 calls."),
+};
+const runScript = (
+  codeMode: CodeMode.CodeMode["Service"],
+  threadId: ThreadId,
+  code: string,
+  options: {
+    readonly bindings?: CodeMode.CodeModeBindings;
+    readonly providerSessionId?: string;
+  } = {},
+) =>
+  codeMode.run({
+    threadId,
+    providerSessionId: options.providerSessionId ?? credential,
+    code,
+    bindings: options.bindings ?? noBindings,
+  });
+
+/** A `t3.hold()` that never returns, until the session it was called from is torn down. */
+const holding = Effect.fn("holding")(function* () {
+  const called = yield* Deferred.make<void>();
+  const stopped = yield* Deferred.make<void>();
+  const bindings: CodeMode.CodeModeBindings = {
+    tools: ["hold"],
+    call: () =>
+      Deferred.succeed(called, undefined).pipe(
+        Effect.andThen(Effect.never),
+        Effect.onInterrupt(() => Deferred.succeed(stopped, undefined)),
+      ),
+  };
+  return { bindings, called: Deferred.await(called), stopped: Deferred.await(stopped) };
+});
+
+const workspace = Effect.flatMap(FileSystem.FileSystem, (fileSystem) =>
+  fileSystem.makeTempDirectoryScoped({ prefix: "t3code-code-mode-" }),
+).pipe(Effect.provide(NodeServices.layer));
+
 const withCodeMode = <A, E, R>(
   use: (codeMode: CodeMode.CodeMode["Service"], runs: Array<string>) => Effect.Effect<A, E, R>,
   options: {
     readonly supportedRuntimeModes?: ReadonlyArray<RuntimeMode>;
     /** Wraps the thread service Code Mode sees; the test body keeps the real one. */
     readonly threads?: (threads: Threads) => Threads;
+    /** Runs scripts in real Node sessions instead of recording them. */
+    readonly realRunner?: boolean;
+    readonly revocations?: Queue.Queue<McpInvocationContext.McpThreadCaller>;
+    readonly settingChanges?: Queue.Queue<ServerSettingsValue>;
+    /** Why each recorded session was ended. */
+    readonly ended?: Array<string>;
+    /** Set to make every recorded session's process report that it exited. */
+    readonly exited?: { reason: string | undefined };
   } = {},
 ) => {
   const runs: Array<string> = [];
@@ -307,14 +363,39 @@ const withCodeMode = <A, E, R>(
             Layer.mock(ProviderInstanceRegistry.ProviderInstanceRegistry)({
               getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
             }),
-            Layer.mock(CodeRunner.CodeRunner)({
-              start: () =>
-                Effect.succeed({
-                  evaluate: (input) => Effect.sync(() => (runs.push(input.code), ran)),
-                  end: () => Effect.void,
-                  ended: Effect.never,
+            options.realRunner === true
+              ? CodeRunner.layer.pipe(Layer.provide(NodeServices.layer))
+              : Layer.mock(CodeRunner.CodeRunner)({
+                  start: () =>
+                    Effect.succeed({
+                      evaluate: (input) => Effect.sync(() => (runs.push(input.code), ran)),
+                      end: (reason) => Effect.sync(() => options.ended?.push(reason)),
+                      ended: Effect.suspend(() =>
+                        options.exited?.reason === undefined
+                          ? Effect.never
+                          : Effect.succeed(options.exited.reason),
+                      ),
+                      hasEnded: Effect.sync(() => options.exited?.reason !== undefined),
+                    }),
                 }),
+            Layer.mock(McpSessionRegistry.McpSessionRegistry)({
+              subscribeRevocations: Effect.succeed(
+                options.revocations === undefined
+                  ? Stream.empty
+                  : Stream.fromQueue(options.revocations),
+              ),
             }),
+            Layer.effect(
+              ServerSettings.ServerSettingsService,
+              Effect.map(ServerSettings.ServerSettingsService, (settings) =>
+                options.settingChanges === undefined
+                  ? settings
+                  : {
+                      ...settings,
+                      subscribeChanges: Effect.succeed(Stream.fromQueue(options.settingChanges)),
+                    },
+              ),
+            ),
           ),
         ),
       ),
@@ -330,7 +411,7 @@ const startAsking = Effect.fn("startAsking")(function* (
 ) {
   const threads = yield* ThreadManagementService.ThreadManagementService;
   const afterSequence = yield* threads.getThreadEventSequence(threadId);
-  const script = yield* codeMode.run(threadId, code).pipe(Effect.forkChild);
+  const script = yield* runScript(codeMode, threadId, code).pipe(Effect.forkChild);
   const pending = yield* threads
     .streamStoredEventsFrom({ threadId, afterSequence, eventType: "runtime-request.updated" })
     .pipe(
@@ -432,7 +513,7 @@ it.effect("asks for each script until the user allows the thread", () =>
       yield* recovery.reconcile("shutdown");
       yield* recovery.reconcile("startup");
       yield* startNextRun(threadId, "after-restart");
-      yield* codeMode.run(threadId, "return 'unasked'");
+      yield* runScript(codeMode, threadId, "return 'unasked'");
       assert.deepEqual(runs, ["return 'once'", "return 'allow'", "return 'unasked'"]);
       const requests = yield* threads.getThreadRecords(threadId, ["runtimeRequests"]);
       assert.deepEqual(requests.runtimeRequests.map((request) => request.decision).toSorted(), [
@@ -486,9 +567,10 @@ it.effect("times out a queued script within one deadline and leaves no card open
       const threads = yield* ThreadManagementService.ThreadManagementService;
       const { threadId } = yield* startTurn("queued-deadline");
       const waiting = yield* startAsking(codeMode, threadId, "return 'waiting'");
-      const behind = yield* codeMode
-        .run(threadId, "return 'behind'")
-        .pipe(Effect.exit, Effect.forkChild);
+      const behind = yield* runScript(codeMode, threadId, "return 'behind'").pipe(
+        Effect.exit,
+        Effect.forkChild,
+      );
 
       yield* TestClock.adjust("50 minutes");
 
@@ -515,9 +597,10 @@ it.effect("asks for each queued script in turn", () =>
 
       const answered = yield* startTurn("queued-answered");
       const first = yield* startAsking(codeMode, answered.threadId, "return 'first'");
-      const queued = yield* codeMode
-        .run(answered.threadId, "return 'second'")
-        .pipe(Effect.exit, Effect.forkChild);
+      const queued = yield* runScript(codeMode, answered.threadId, "return 'second'").pipe(
+        Effect.exit,
+        Effect.forkChild,
+      );
       const beforeAnswer = yield* threads.getThreadEventSequence(answered.threadId);
       yield* respond(answered.threadId, first.requestId, "accept");
       yield* Fiber.join(first.script);
@@ -601,9 +684,11 @@ it.effect("runs nothing when the user declines, the call is cancelled, or the tu
           assert.deepEqual(yield* statusOf(cancelled.requestId), ["resolved", "cancelled"]);
 
           opening.armed = true;
-          const cancelledAtOpen = yield* codeMode
-            .run(threadId, "return 'cancelled at open'")
-            .pipe(Effect.forkChild);
+          const cancelledAtOpen = yield* runScript(
+            codeMode,
+            threadId,
+            "return 'cancelled at open'",
+          ).pipe(Effect.forkChild);
           yield* Deferred.await(opening.committed);
           yield* Fiber.interrupt(cancelledAtOpen).pipe(
             Effect.forkChild({ startImmediately: true }),
@@ -655,4 +740,484 @@ it.effect("runs nothing when the user declines, the call is cancelled, or the tu
       { threads: threadsHeldAtOpen },
     );
   }).pipe(Effect.provide(layerTest)),
+);
+
+/** What a result says about its session, beside its output. */
+const sessionOf = (result: CodeMode.CodeRunResult) => ({
+  status: result.status,
+  result: result.result,
+  sessionStarted: result.sessionStarted,
+  notice: result.notice,
+});
+
+it.effect("returns a handle after 20 seconds, polls it, and refuses a second run meanwhile", () =>
+  withCodeMode(
+    (codeMode) =>
+      Effect.gen(function* () {
+        const { threadId } = yield* startTurn(
+          "background",
+          "full-access",
+          instanceId,
+          yield* workspace,
+        );
+        const called = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<string>();
+        const bindings: CodeMode.CodeModeBindings = {
+          tools: ["hold"],
+          call: () =>
+            Deferred.succeed(called, undefined).pipe(Effect.andThen(Deferred.await(release))),
+        };
+        const first = yield* runScript(
+          codeMode,
+          threadId,
+          "globalThis.kept = 1; return await t3.hold();",
+          { bindings },
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(called);
+        yield* TestClock.adjust(CodeMode.YIELD_AFTER);
+        const started = yield* Fiber.join(first);
+        assert.deepEqual(sessionOf(started), {
+          status: "running",
+          result: undefined,
+          sessionStarted: true,
+          notice: undefined,
+        });
+
+        const busy = yield* runScript(codeMode, threadId, "return 2").pipe(Effect.flip);
+        assert.equal(
+          busy.message,
+          `${started.handle} is still running: poll it or call t3_code_reset.`,
+        );
+
+        const polled = yield* codeMode
+          .poll({
+            threadId,
+            providerSessionId: credential,
+            handle: started.handle,
+            wait: Duration.minutes(1),
+          })
+          .pipe(Effect.forkChild);
+        yield* Deferred.succeed(release, "released");
+        assert.deepEqual(sessionOf(yield* Fiber.join(polled)), {
+          status: "done",
+          result: "released",
+          sessionStarted: true,
+          notice: undefined,
+        });
+        assert.deepEqual(sessionOf(yield* runScript(codeMode, threadId, "return kept")), {
+          status: "done",
+          result: 1,
+          sessionStarted: undefined,
+          notice: undefined,
+        });
+      }),
+    { realRunner: true },
+  ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("starts a new session after a reset, a timeout or a cancelled call, and says why", () =>
+  withCodeMode(
+    (codeMode) =>
+      Effect.gen(function* () {
+        const { threadId } = yield* startTurn(
+          "restarts",
+          "full-access",
+          instanceId,
+          yield* workspace,
+        );
+        const kept = "return typeof globalThis.kept;";
+        const keep = "globalThis.kept = 1;";
+
+        yield* runScript(codeMode, threadId, keep);
+        assert.equal((yield* runScript(codeMode, threadId, kept)).result, "number");
+        assert.deepEqual(yield* codeMode.reset({ threadId, providerSessionId: credential }), {
+          ended: true,
+        });
+        assert.deepEqual(sessionOf(yield* runScript(codeMode, threadId, kept)), {
+          status: "done",
+          result: "undefined",
+          sessionStarted: true,
+          notice: "t3_code_reset ended the previous session.",
+        });
+
+        yield* runScript(codeMode, threadId, keep);
+        const timedOut = yield* holding();
+        const long = yield* runScript(codeMode, threadId, "await t3.hold();", {
+          bindings: timedOut.bindings,
+        }).pipe(Effect.forkChild);
+        yield* timedOut.called;
+        yield* TestClock.adjust(CodeMode.YIELD_AFTER);
+        const handle = (yield* Fiber.join(long)).handle;
+        yield* TestClock.adjust(CodeRunner.RUN_TIMEOUT);
+        yield* timedOut.stopped;
+        const unknown = yield* codeMode
+          .poll({ threadId, providerSessionId: credential, handle, wait: Duration.zero })
+          .pipe(Effect.flip);
+        assert.equal(
+          unknown.message,
+          `Evaluation ${handle} is gone: the session restarted, so its globalThis values are gone too. The script ran longer than 10 minutes and was stopped.`,
+        );
+        assert.deepEqual(sessionOf(yield* runScript(codeMode, threadId, kept)), {
+          status: "done",
+          result: "undefined",
+          sessionStarted: true,
+          notice: "The script ran longer than 10 minutes and was stopped.",
+        });
+
+        yield* runScript(codeMode, threadId, keep);
+        const dropped = yield* holding();
+        const cancelled = yield* runScript(codeMode, threadId, "await t3.hold();", {
+          bindings: dropped.bindings,
+        }).pipe(Effect.forkChild);
+        yield* dropped.called;
+        yield* Fiber.interrupt(cancelled);
+        yield* dropped.stopped;
+        const afterCancel = yield* runScript(codeMode, threadId, kept);
+        assert.equal(afterCancel.result, "undefined");
+        assert.equal(afterCancel.sessionStarted, true);
+        assert.match(
+          afterCancel.notice ?? "",
+          /^The t3_code_run call that started .+ was cancelled/,
+        );
+      }),
+    { realRunner: true },
+  ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("starts a new session for a new or revoked credential", () =>
+  Effect.gen(function* () {
+    const revocations = yield* Queue.unbounded<McpInvocationContext.McpThreadCaller>();
+    yield* withCodeMode(
+      (codeMode) =>
+        Effect.gen(function* () {
+          const { threadId } = yield* startTurn(
+            "credentials",
+            "full-access",
+            instanceId,
+            yield* workspace,
+          );
+          const kept = "return typeof globalThis.kept;";
+
+          yield* runScript(codeMode, threadId, "globalThis.kept = 1;");
+          assert.deepEqual(
+            sessionOf(
+              yield* runScript(codeMode, threadId, kept, { providerSessionId: "credential:next" }),
+            ),
+            {
+              status: "done",
+              result: "undefined",
+              sessionStarted: true,
+              notice:
+                "A new provider session took over this thread, so its previous session ended.",
+            },
+          );
+
+          const held = yield* holding();
+          yield* runScript(codeMode, threadId, "globalThis.kept = 1; await t3.hold();", {
+            bindings: held.bindings,
+            providerSessionId: "credential:next",
+          }).pipe(Effect.forkChild);
+          yield* held.called;
+          yield* Queue.offer(revocations, {
+            threadId,
+            providerSessionId: "credential:other",
+            providerInstanceId: instanceId,
+          });
+          yield* Queue.offer(revocations, {
+            threadId,
+            providerSessionId: "credential:next",
+            providerInstanceId: instanceId,
+          });
+          yield* held.stopped;
+          assert.deepEqual(sessionOf(yield* runScript(codeMode, threadId, kept)), {
+            status: "done",
+            result: "undefined",
+            sessionStarted: true,
+            notice: "The provider session that started the previous session ended.",
+          });
+        }),
+      { realRunner: true, revocations },
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "stops a running evaluation when its turn ends, the mode changes, the thread is archived or Code Mode is turned off",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
+      const settingChanges = yield* Queue.unbounded<ServerSettingsValue>();
+      const withEvents = (threads: Threads): Threads => ({
+        ...threads,
+        streamDomainEvents: Stream.merge(threads.streamDomainEvents, Stream.fromQueue(events)),
+      });
+      yield* withCodeMode(
+        (codeMode) =>
+          Effect.gen(function* () {
+            const threads = yield* ThreadManagementService.ThreadManagementService;
+            const settings = yield* ServerSettings.ServerSettingsService;
+            const cwd = yield* workspace;
+            /** Starts a held evaluation, runs `stop`, and returns what the next call says. */
+            const stoppedBy = Effect.fn("stoppedBy")(function* <E, R>(
+              threadId: ThreadId,
+              stop: Effect.Effect<unknown, E, R>,
+            ) {
+              const held = yield* holding();
+              const started = yield* runScript(
+                codeMode,
+                threadId,
+                "globalThis.kept = 1; await t3.hold();",
+                {
+                  bindings: held.bindings,
+                },
+              ).pipe(Effect.forkChild);
+              yield* held.called;
+              yield* TestClock.adjust(CodeMode.YIELD_AFTER);
+              const { handle } = yield* Fiber.join(started);
+              yield* stop;
+              yield* held.stopped;
+              return {
+                handle,
+                next: yield* runScript(codeMode, threadId, "return typeof globalThis.kept;"),
+              };
+            });
+
+            const ended = yield* startTurn("turn-ended", "full-access", instanceId, cwd);
+            const turnEnd = yield* stoppedBy(
+              ended.threadId,
+              Effect.gen(function* () {
+                const projections = yield* ProjectionStore.ProjectionStoreV2;
+                const { runs } = yield* threads.getThreadRecords(ended.threadId, ["runs"]);
+                const run = runs[0]!;
+                const now = yield* DateTime.now;
+                const event = {
+                  id: EventId.make("seed:turn-ended:interrupted"),
+                  type: "run.updated",
+                  threadId: ended.threadId,
+                  runId: run.id,
+                  occurredAt: now,
+                  payload: { ...run, status: "interrupted", completedAt: now },
+                } as OrchestrationV2DomainEvent;
+                yield* projections.apply(event);
+                yield* startNextRun(ended.threadId, "turn-ended-next");
+                yield* Queue.offer(events, event);
+              }),
+            );
+            assert.deepEqual(sessionOf(turnEnd.next), {
+              status: "done",
+              result: "undefined",
+              sessionStarted: true,
+              notice: `The turn that started ${turnEnd.handle} ended, so its session was stopped.`,
+            });
+
+            const moved = yield* startTurn("mode-changed", "full-access", instanceId, cwd);
+            const modeChange = yield* stoppedBy(
+              moved.threadId,
+              threads.dispatch({
+                type: "thread.runtime-mode.set",
+                commandId: CommandId.make("mode:mode-changed"),
+                threadId: moved.threadId,
+                runtimeMode: "auto",
+              }),
+            );
+            assert.deepEqual(sessionOf(modeChange.next), {
+              status: "done",
+              result: "undefined",
+              sessionStarted: true,
+              notice: `The thread's mode changed while ${modeChange.handle} ran, so its session was stopped.`,
+            });
+
+            const archived = yield* startTurn("archived", "full-access", instanceId, cwd);
+            const archive = yield* stoppedBy(
+              archived.threadId,
+              Effect.gen(function* () {
+                const shell = yield* threads.getThreadShell(archived.threadId);
+                yield* Queue.offer(events, {
+                  id: EventId.make("seed:archived"),
+                  type: "thread.archived",
+                  threadId: archived.threadId,
+                  occurredAt: yield* DateTime.now,
+                  payload: shell,
+                } as OrchestrationV2DomainEvent);
+              }),
+            );
+            assert.deepEqual(sessionOf(archive.next), {
+              status: "done",
+              result: "undefined",
+              sessionStarted: true,
+              notice: "The thread was archived, so its session ended.",
+            });
+
+            const off = yield* startTurn("turned-off", "full-access", instanceId, cwd);
+            const turnOff = yield* stoppedBy(
+              off.threadId,
+              settings.getSettings.pipe(
+                Effect.flatMap((current) =>
+                  Queue.offer(settingChanges, { ...current, codeModeEnabled: false }),
+                ),
+              ),
+            );
+            assert.deepEqual(sessionOf(turnOff.next), {
+              status: "done",
+              result: "undefined",
+              sessionStarted: true,
+              notice: "Code Mode was turned off, so every session ended.",
+            });
+          }),
+        { realRunner: true, threads: withEvents, settingChanges },
+      );
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("refuses a t3 call once the turn that started the evaluation has ended", () =>
+  withCodeMode(
+    (codeMode) =>
+      Effect.gen(function* () {
+        const { threadId } = yield* startTurn(
+          "late-call",
+          "full-access",
+          instanceId,
+          yield* workspace,
+        );
+        const called = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const reached: Array<string> = [];
+        const bindings: CodeMode.CodeModeBindings = {
+          tools: ["hold", "t3_thread_list"],
+          call: (tool) =>
+            tool === "hold"
+              ? Deferred.succeed(called, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.as(null),
+                )
+              : Effect.sync(() => (reached.push(tool), null)),
+        };
+        const script = yield* runScript(
+          codeMode,
+          threadId,
+          "await t3.hold(); return await t3.t3_thread_list({}).catch((error) => error.message);",
+          { bindings },
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(called);
+        // The turn ends without an event, so only the call's own check can refuse it.
+        yield* startNextRun(threadId, "late-call-next");
+        yield* Deferred.succeed(release, undefined);
+
+        assert.equal(
+          (yield* Fiber.join(script)).result,
+          "t3.t3_thread_list was refused: the turn that started this evaluation has ended.",
+        );
+        assert.deepEqual(reached, []);
+      }),
+    { realRunner: true },
+  ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("ends a session after 10 idle minutes", () =>
+  withCodeMode(
+    (codeMode) =>
+      Effect.gen(function* () {
+        const { threadId } = yield* startTurn("idle", "full-access", instanceId, yield* workspace);
+        yield* runScript(codeMode, threadId, "globalThis.kept = 1;");
+        yield* TestClock.adjust(Duration.subtract(CodeMode.IDLE_TIMEOUT, Duration.seconds(1)));
+        assert.equal(
+          (yield* runScript(codeMode, threadId, "return typeof globalThis.kept;")).result,
+          "number",
+        );
+        yield* TestClock.adjust(CodeMode.IDLE_TIMEOUT);
+        assert.deepEqual(
+          sessionOf(yield* runScript(codeMode, threadId, "return typeof globalThis.kept;")),
+          {
+            status: "done",
+            result: "undefined",
+            sessionStarted: true,
+            notice: "The previous session ended after 10 idle minutes.",
+          },
+        );
+      }),
+    { realRunner: true },
+  ).pipe(Effect.provide(layerTest)),
+);
+
+it.effect("stops the least recently used session to start one past the limit", () => {
+  const ended: Array<string> = [];
+  return withCodeMode(
+    (codeMode) =>
+      Effect.gen(function* () {
+        const threadIds: Array<ThreadId> = [];
+        for (let index = 0; index <= CodeMode.SESSION_LIMIT; index++) {
+          threadIds.push((yield* startTurn(`lru-${index}`, "full-access")).threadId);
+        }
+        const [first, second] = threadIds;
+        for (const threadId of threadIds.slice(0, CodeMode.SESSION_LIMIT)) {
+          yield* runScript(codeMode, threadId, "return 1");
+        }
+        yield* runScript(codeMode, first!, "return 1");
+        assert.deepEqual(ended, []);
+
+        yield* runScript(codeMode, threadIds[CodeMode.SESSION_LIMIT]!, "return 1");
+        const evicted =
+          "The previous session was stopped to make room: at most 16 sessions run at once.";
+        assert.deepEqual(ended, [evicted]);
+        assert.equal((yield* runScript(codeMode, first!, "return 1")).sessionStarted, undefined);
+        assert.deepEqual(sessionOf(yield* runScript(codeMode, second!, "return 1")), {
+          status: "done",
+          result: null,
+          sessionStarted: true,
+          notice: evicted,
+        });
+      }),
+    { ended },
+  ).pipe(Effect.provide(layerTest));
+});
+
+it.effect("starts a new session when the previous one's process exited on its own", () => {
+  const exited: { reason: string | undefined } = { reason: undefined };
+  return withCodeMode(
+    (codeMode) =>
+      Effect.gen(function* () {
+        const { threadId } = yield* startTurn("exited", "full-access");
+        yield* runScript(codeMode, threadId, "return 1");
+        exited.reason = "The session's process exited with code 1.";
+        const next = yield* runScript(codeMode, threadId, "return 1");
+        exited.reason = undefined;
+        assert.deepEqual(sessionOf(next), {
+          status: "done",
+          result: null,
+          sessionStarted: true,
+          notice: "The session's process exited with code 1.",
+        });
+      }),
+    { exited },
+  ).pipe(Effect.provide(layerTest));
+});
+
+it.effect("refuses a second script while one runs without asking about it", () =>
+  withCodeMode(
+    (codeMode) =>
+      Effect.gen(function* () {
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        const { threadId } = yield* startTurn(
+          "busy-asks",
+          "approval-required",
+          instanceId,
+          yield* workspace,
+        );
+        const held = yield* holding();
+        const afterSequence = yield* threads.getThreadEventSequence(threadId);
+        const first = yield* runScript(codeMode, threadId, "await t3.hold();", {
+          bindings: held.bindings,
+        }).pipe(Effect.forkChild);
+        yield* respond(threadId, yield* pendingCardAfter(threadId, afterSequence), "accept");
+        yield* held.called;
+        yield* TestClock.adjust(CodeMode.YIELD_AFTER);
+        const { handle } = yield* Fiber.join(first);
+
+        const busy = yield* runScript(codeMode, threadId, "return 2").pipe(Effect.flip);
+        assert.equal(busy.message, `${handle} is still running: poll it or call t3_code_reset.`);
+        const { runtimeRequests } = yield* threads.getThreadRecords(threadId, ["runtimeRequests"]);
+        assert.equal(runtimeRequests.length, 1);
+      }),
+    { realRunner: true },
+  ).pipe(Effect.provide(layerTest)),
 );

@@ -61,12 +61,15 @@ See the [provider guides](./install.md#providers) for setup and provider-specifi
 
 ## Code Mode (experimental)
 
-Code Mode gives agents in every thread a tool that runs one JavaScript program per call. One
-program can run several commands at once, repeat an edit across many files, or filter long
-output, and only what it returns goes back into the conversation. It works with every provider.
+Code Mode gives agents in every thread a JavaScript session that T3 Code runs. One call can run
+several commands at once, repeat an edit across many files, filter long output, or call T3 Code's
+thread and task tools, and only what it returns goes back into the conversation. Values a script
+stores on `globalThis` stay for the thread's later calls. A call that runs past 20 seconds keeps
+going, and the agent checks on it later. It works with every provider.
 
 Turn on **Code Mode** in **Settings → Threads → Agent tools**. The setting applies to the whole
-environment. Turning it off refuses the next script. Code Mode is not available on Windows yet.
+environment. Turning it off stops running scripts and refuses new ones. Code Mode is not available
+on Windows yet.
 
 | Mode                                  | Scripts                                                                                     |
 | ------------------------------------- | ------------------------------------------------------------------------------------------- |
@@ -79,7 +82,11 @@ A thread whose provider runs its mode as **Supervised** asks too.
 **Allow for this thread** lasts as long as the thread does, including after a restart. Nothing
 revokes it yet. To stop that thread's scripts, switch it to Plan mode, or turn Code Mode off.
 
-A script runs in the thread's project folder or worktree with T3 Code's own environment, and it
-stops after 10 minutes. Commands inside a script bypass the provider's own permission rules,
-hooks, and safety checks. Some providers may also ask before they call the tool. Turn Code Mode
-on only where you trust agents with the thread's file and shell access.
+Scripts run in the thread's project folder or worktree with T3 Code's own environment. A script
+stops after 10 minutes, or when the turn that started it ends, the thread's mode changes, or the
+thread is archived. The session itself ends after 10 idle minutes, when the agent resets it, when
+the provider session ends, or when T3 Code restarts, and the agent is told its stored values are
+gone. Commands inside a script bypass the provider's own permission rules, hooks, and safety
+checks. T3 Code tools a script calls run with the thread's own permissions. Some providers may
+also ask before they call the tool. Turn Code Mode on only where you trust agents with the
+thread's file and shell access.

@@ -95,7 +95,7 @@ export const RESPONSE_LIMIT_BYTES = 64 * 1024;
 /** Room left in the response for what Code Mode adds around an evaluation's output. */
 const ENVELOPE_BYTES = 1024;
 /** Each `t3` request and each result sent back to the script. */
-const CALL_LIMIT_BYTES = 64 * 1024;
+export const CALL_LIMIT_BYTES = 64 * 1024;
 const CALLS_IN_FLIGHT = 8;
 /** V8's old-generation cap for each session, in MiB. */
 const SESSION_HEAP_MIB = 256;

@@ -4,6 +4,8 @@ import * as Layer from "effect/Layer";
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Stream from "effect/Stream";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 import * as TestClock from "effect/testing/TestClock";
@@ -36,31 +38,35 @@ const makeRegistry = (now: (() => number) | undefined, httpServer = fakeHttpServ
       Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
     );
 
-it.effect("stores only a token hash, resolves the bearer token, and revokes by thread", () =>
-  Effect.gen(function* () {
-    let timestamp = 1_000;
-    const registry = yield* makeRegistry(() => timestamp);
-    const threadId = ThreadId.make("thread-1");
-    const issued = yield* registry.issue({
-      threadId,
-      providerInstanceId: ProviderInstanceId.make("codex"),
-      capabilities: new Set(["preview"]),
-    });
-    expect(issued.config.endpoint).toBe("http://127.0.0.1:43123/mcp");
-    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
-    expect(token.length).toBeGreaterThan(20);
+it.effect(
+  "stores only a token hash, resolves the bearer token, and revokes by thread, announcing it",
+  () =>
+    Effect.gen(function* () {
+      let timestamp = 1_000;
+      const registry = yield* makeRegistry(() => timestamp);
+      const threadId = ThreadId.make("thread-1");
+      const issued = yield* registry.issue({
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(["preview"]),
+      });
+      expect(issued.config.endpoint).toBe("http://127.0.0.1:43123/mcp");
+      const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+      expect(token.length).toBeGreaterThan(20);
 
-    const resolved = yield* registry.resolve(token);
-    expect(resolved?.thread.threadId).toBe(threadId);
-    expect(resolved?.capabilities).toEqual(
-      new Set(["preview", "orchestration", "worktree", "pull-requests"]),
-    );
+      const resolved = yield* registry.resolve(token);
+      expect(resolved?.thread.threadId).toBe(threadId);
+      expect(resolved?.capabilities).toEqual(
+        new Set(["preview", "orchestration", "worktree", "pull-requests"]),
+      );
 
-    yield* registry.revokeThread(threadId);
-    expect(yield* registry.resolve(token)).toBeUndefined();
+      const revocations = yield* registry.subscribeRevocations;
+      yield* registry.revokeThread(threadId);
+      expect(yield* registry.resolve(token)).toBeUndefined();
+      expect(Option.getOrUndefined(yield* Stream.runHead(revocations))).toEqual(resolved?.thread);
 
-    timestamp += 2_000;
-  }),
+      timestamp += 2_000;
+    }),
 );
 
 it.effect("always grants pull-requests and gates browser and device access independently", () =>

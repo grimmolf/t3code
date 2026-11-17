@@ -2,13 +2,14 @@ import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
-import type * as Scope from "effect/Scope";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
@@ -93,10 +94,12 @@ const ENVELOPE_BYTES = 1024;
 const CALL_LIMIT_BYTES = 64 * 1024;
 const CALLS_IN_FLIGHT = 8;
 /** V8's old-generation cap for each session, in MiB. */
-const SESSION_HEAP_MIB = 512;
+const SESSION_HEAP_MIB = 256;
 // A result line holds at most 64K characters of JSON, which escaping can grow several times over.
 const CHANNEL_LINE_LIMIT = 1024 * 1024;
 const TRUNCATED_MARKER = "\n[truncated]";
+// The child writes these keys first, so a call too long to parse can still be refused.
+const CALL_HEAD = /^\{"type":"call","evaluation":"[^"\\]*","callId":(\d+),"tool":"([\w-]+)"/u;
 
 const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
 
@@ -132,6 +135,8 @@ const fitResponse = (input: {
   readonly error: string | null;
   readonly stdout: Collected;
   readonly stderr: Collected;
+  /** A `$` command's output was cut to its end. */
+  readonly shellTruncated: boolean;
   readonly t3Calls: number;
 }): CodeRunOutput => {
   let remaining =
@@ -145,7 +150,8 @@ const fitResponse = (input: {
       error: null,
       t3Calls: input.t3Calls,
     });
-  let truncated = input.resultCut || input.stdout.truncated || input.stderr.truncated;
+  let truncated =
+    input.resultCut || input.stdout.truncated || input.stderr.truncated || input.shellTruncated;
   const take = (text: string, alreadyCut: boolean) => {
     const whole = alreadyCut ? text + TRUNCATED_MARKER : text;
     if (jsonBytes(whole) <= remaining) {
@@ -194,6 +200,7 @@ const ChildMessage = Schema.Union([
     json: Schema.optional(Schema.String),
     error: Schema.optional(Schema.String),
     cut: Schema.Boolean,
+    shellTruncated: Schema.Boolean,
   }),
   Schema.Struct({
     type: Schema.Literal("call"),
@@ -237,6 +244,7 @@ interface Settled {
   readonly resultJson: string | null;
   readonly error: string | null;
   readonly cut: boolean;
+  readonly shellTruncated: boolean;
 }
 
 /** One evaluation's share of stdout or stderr: what arrived before its marker. */
@@ -254,6 +262,8 @@ interface Running {
   readonly settled: Deferred.Deferred<Settled>;
   readonly stdout: Capture;
   readonly stderr: Capture;
+  /** Holds its `t3` calls, which end with it. */
+  readonly callScope: Scope.Closeable;
   inFlight: number;
   calls: number;
 }
@@ -302,14 +312,22 @@ const makeOutput = () => {
       append(owner, text.slice(0, text.length - keep));
       carry = text.slice(text.length - keep);
     },
+    /** Hands over what was held back, once no marker can follow it. */
+    flush: () => {
+      const rest = carry + decoder.decode();
+      carry = "";
+      if (capture !== undefined) append(capture, rest);
+    },
   };
 };
+type Output = ReturnType<typeof makeOutput>;
 
 const make = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const executablePath = yield* HostProcess.ExecutablePath;
 
   const start = Effect.fn("CodeRunner.start")(function* (input: CodeSessionInput) {
+    const sessionScope = yield* Scope.Scope;
     const environment: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: "1" };
     for (const [name, value] of Object.entries(input.environment)) {
       if (!isServerOnlyVariable(name)) environment[name] = value;
@@ -365,13 +383,15 @@ const make = Effect.gen(function* () {
 
     const drain = (
       stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>,
-      onChunk: (chunk: Uint8Array) => void,
+      output: Output,
       closed: Deferred.Deferred<void>,
     ) =>
       stream.pipe(
-        Stream.runForEach((chunk) => Effect.sync(() => onChunk(chunk))),
+        Stream.runForEach((chunk) => Effect.sync(() => output.feed(chunk))),
         Effect.ignore,
-        Effect.ensuring(Deferred.succeed(closed, undefined)),
+        Effect.ensuring(
+          Effect.sync(output.flush).pipe(Effect.andThen(Deferred.succeed(closed, undefined))),
+        ),
         Effect.forkScoped,
       );
 
@@ -406,13 +426,8 @@ const make = Effect.gen(function* () {
     });
 
     // Untraced: it runs once per t3 call, inside the session's own span.
-    const onCall = Effect.fnUntraced(function* (line: string, call: CallMessage) {
+    const onCall = Effect.fnUntraced(function* (call: CallMessage) {
       const running = current;
-      if (Buffer.byteLength(line) > CALL_LIMIT_BYTES) {
-        return yield* send(
-          refusal(call.callId, `t3.${call.tool}: the request is larger than 64 KiB.`),
-        );
-      }
       if (running === undefined || running.id !== call.evaluation) {
         return yield* send(
           refusal(
@@ -432,26 +447,54 @@ const make = Effect.gen(function* () {
       running.inFlight += 1;
       running.calls += 1;
       yield* answer(running, call).pipe(
+        // Interrupted when its evaluation ends; the reply settles the script's promise.
+        Effect.onInterrupt(() =>
+          send(
+            refusal(
+              call.callId,
+              `t3.${call.tool} was stopped: the evaluation that called it has finished.`,
+            ),
+          ),
+        ),
         Effect.ensuring(Effect.sync(() => (running.inFlight -= 1))),
-        Effect.forkScoped,
+        Effect.forkIn(running.callScope, { startImmediately: true }),
       );
     });
 
+    const refuseOversized = (line: string) => {
+      const head = CALL_HEAD.exec(line.slice(0, 1024));
+      return head === null
+        ? Effect.succeed(false)
+        : send(refusal(Number(head[1]), `t3.${head[2]}: the request is larger than 64 KiB.`)).pipe(
+            Effect.as(true),
+          );
+    };
+
     const unreadable = "The session wrote a message T3 could not read, so it was stopped.";
     let pending = "";
+    /** Set while the rest of a refused call's line is skipped. */
+    let skipping = false;
     const channelDecoder = new TextDecoder();
     // Untraced: it runs once per chunk the session writes to its channel.
     const onChannel = Effect.fnUntraced(function* (chunk: Uint8Array) {
-      pending += channelDecoder.decode(chunk, { stream: true });
+      let text = channelDecoder.decode(chunk, { stream: true });
+      if (skipping) {
+        const lineEnd = text.indexOf("\n");
+        if (lineEnd === -1) return;
+        skipping = false;
+        text = text.slice(lineEnd + 1);
+      }
+      pending += text;
       let newline = pending.indexOf("\n");
       while (newline !== -1) {
         const line = pending.slice(0, newline);
         pending = pending.slice(newline + 1);
         newline = pending.indexOf("\n");
+        if (Buffer.byteLength(line) > CALL_LIMIT_BYTES && (yield* refuseOversized(line))) continue;
         const message = decodeChildMessage(line);
         if (Option.isNone(message)) return yield* end(unreadable);
         if (message.value.type === "call") {
-          yield* onCall(line, message.value);
+          yield* onCall(message.value);
           continue;
         }
         const result = message.value;
@@ -460,14 +503,20 @@ const make = Effect.gen(function* () {
             resultJson: result.json ?? null,
             error: result.error ?? null,
             cut: result.cut,
+            shellTruncated: result.shellTruncated,
           });
         }
       }
-      if (pending.length > CHANNEL_LINE_LIMIT) yield* end(unreadable);
+      if (pending.length > CALL_LIMIT_BYTES && (yield* refuseOversized(pending))) {
+        pending = "";
+        skipping = true;
+      } else if (pending.length > CHANNEL_LINE_LIMIT) {
+        yield* end(unreadable);
+      }
     });
 
-    yield* drain(handle.stdout, stdout.feed, stdoutClosed);
-    yield* drain(handle.stderr, stderr.feed, stderrClosed);
+    yield* drain(handle.stdout, stdout, stdoutClosed);
+    yield* drain(handle.stderr, stderr, stderrClosed);
     yield* handle
       .getOutputFd(3)
       .pipe(Stream.runForEach(onChannel), Effect.ignore, Effect.forkScoped);
@@ -489,31 +538,11 @@ const make = Effect.gen(function* () {
     const graceOver = <A>(effect: Effect.Effect<A>) =>
       effect.pipe(Effect.timeoutOption(PIPE_GRACE), Effect.map(Option.isNone));
 
-    const evaluate = Effect.fn("CodeSession.evaluate")(function* (evaluation: EvaluateInput) {
-      if (current !== undefined) return yield* Effect.die("A code session runs one evaluation.");
-      const capture = () => ({
-        marker: `\u0000t3-evaluation-end:${id}\u0000`,
-        text: "",
-        bytes: 0,
-        truncated: false,
-        seen: Deferred.makeUnsafe<void>(),
-      });
-      const id = yield* randomUuidV4;
-      const running: Running = {
-        id,
-        call: evaluation.call,
-        settled: yield* Deferred.make<Settled>(),
-        stdout: capture(),
-        stderr: capture(),
-        inFlight: 0,
-        calls: 0,
-      };
-      current = running;
-      stdout.install(running.stdout);
-      stderr.install(running.stderr);
+    // Untraced: it is the body of CodeSession.evaluate, which holds the span.
+    const outcomeOf = Effect.fnUntraced(function* (running: Running, evaluation: EvaluateInput) {
       yield* send({
         type: "evaluate",
-        id,
+        id: running.id,
         code: evaluation.code,
         marker: running.stdout.marker,
         tools: evaluation.tools,
@@ -551,7 +580,10 @@ const make = Effect.gen(function* () {
         const reason = yield* Deferred.await(exited);
         error = heldOpen ? `${reason}\n${PIPES_HELD}` : reason;
       }
-      current = undefined;
+      if (heldOpen || unmarked || Option.isNone(settled)) {
+        stdout.flush();
+        stderr.flush();
+      }
       return fitResponse({
         resultJson: Option.isSome(settled) ? settled.value.resultJson : null,
         resultCut: Option.isSome(settled) && settled.value.cut && settled.value.resultJson !== null,
@@ -561,8 +593,43 @@ const make = Effect.gen(function* () {
           truncated: running.stdout.truncated || heldOpen || unmarked,
         },
         stderr: { text: running.stderr.text, truncated: running.stderr.truncated || heldOpen },
+        shellTruncated: Option.isSome(settled) && settled.value.shellTruncated,
         t3Calls: running.calls,
       });
+    });
+
+    const evaluate = Effect.fn("CodeSession.evaluate")(function* (evaluation: EvaluateInput) {
+      if (current !== undefined) return yield* Effect.die("A code session runs one evaluation.");
+      const capture = () => ({
+        marker: `\u0000t3-evaluation-end:${id}\u0000`,
+        text: "",
+        bytes: 0,
+        truncated: false,
+        seen: Deferred.makeUnsafe<void>(),
+      });
+      const id = yield* randomUuidV4;
+      const running: Running = {
+        id,
+        call: evaluation.call,
+        settled: yield* Deferred.make<Settled>(),
+        stdout: capture(),
+        stderr: capture(),
+        callScope: yield* Scope.fork(sessionScope),
+        inFlight: 0,
+        calls: 0,
+      };
+      current = running;
+      stdout.install(running.stdout);
+      stderr.install(running.stderr);
+      // A t3 call the script did not await stops here, before anyone reads the output.
+      return yield* outcomeOf(running, evaluation).pipe(
+        Effect.ensuring(
+          Effect.suspend(() => {
+            current = undefined;
+            return Scope.close(running.callScope, Exit.void);
+          }),
+        ),
+      );
     });
 
     return {

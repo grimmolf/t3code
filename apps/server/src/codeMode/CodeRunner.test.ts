@@ -139,6 +139,23 @@ it.layer(layerTest)("CodeRunner", (it) => {
       }),
     );
 
+    it.effect("keeps the end of each stream past 8 MiB and says it was cut", () =>
+      Effect.gen(function* () {
+        const output = yield* run(
+          [
+            "const long = await $`yes | head -c 9000000`;",
+            "const short = await $`echo hi`;",
+            "return [long.stdout.length, long.stdout.slice(-2), long.truncated, short.truncated];",
+          ].join("\n"),
+        );
+        expect(output).toMatchObject({
+          result: [8 * 1024 * 1024, "y\n", true, false],
+          truncated: true,
+          error: null,
+        });
+      }),
+    );
+
     it.effect("gives shell children T3's environment without its credentials or settings", () =>
       Effect.gen(function* () {
         const output = yield* run(
@@ -288,6 +305,43 @@ it.layer(layerTest)("CodeRunner", (it) => {
         });
       }),
     );
+
+    it.effect("returns at once, with what it wrote last, when a script exits the process", () =>
+      Effect.gen(function* () {
+        const started = yield* session();
+        const output = yield* started.evaluate({
+          code: `await new Promise((resolve) => process.stdout.write("bye\\n", resolve)); process.exit(7);`,
+          tools: [],
+          call: noCalls,
+        });
+
+        expect(output).toMatchObject({
+          stdout: "bye\n",
+          error: "The session's process exited with code 7.",
+        });
+        expect(yield* started.ended).toBe("The session's process exited with code 7.");
+      }),
+    );
+
+    it.effect("keeps the session when a callback throws, and writes the error to stderr", () =>
+      Effect.gen(function* () {
+        const started = yield* session();
+        const evaluate = (code: string) => started.evaluate({ code, tools: [], call: noCalls });
+
+        const thrown = yield* evaluate(
+          [
+            "globalThis.kept = 1;",
+            "setTimeout(() => { throw new Error('boom'); }, 0);",
+            "await new Promise((resolve) => setTimeout(resolve, 0));",
+            "return 'after';",
+          ].join("\n"),
+        );
+
+        expect(thrown).toMatchObject({ result: "after", error: null });
+        expect(thrown.stderr).toContain("Uncaught error: Error: boom");
+        expect((yield* evaluate("return typeof kept;")).result).toBe("number");
+      }),
+    );
   });
 
   describe("t3", () => {
@@ -334,6 +388,89 @@ it.layer(layerTest)("CodeRunner", (it) => {
       }),
     );
 
+    it.effect("refuses arguments it cannot send, and keeps the session", () =>
+      Effect.gen(function* () {
+        const started = yield* session();
+        const calls: Array<string> = [];
+        const output = yield* started.evaluate({
+          tools,
+          code: [
+            "const circular = {}; circular.self = circular;",
+            "const refused = [];",
+            "for (const args of [{ n: 10n }, circular, () => 1, { text: 'x'.repeat(2_000_000) }]) {",
+            "  refused.push(await t3.t3_thread_list(args).then(() => 'sent', (error) => [error.name, error.message]));",
+            "}",
+            "return { refused, after: await t3.t3_thread_read({}) };",
+          ].join("\n"),
+          call: (tool) => Effect.sync(() => (calls.push(tool), "read")),
+        });
+
+        const notJson = "t3.t3_thread_list: its arguments cannot be sent as JSON";
+        expect(output).toMatchObject({
+          result: {
+            refused: [
+              ["T3ToolError", expect.stringMatching(new RegExp(`^${notJson}: .*BigInt`))],
+              ["T3ToolError", expect.stringMatching(new RegExp(`^${notJson}: .*circular`))],
+              ["T3ToolError", `${notJson}.`],
+              ["T3ToolError", "t3.t3_thread_list: the request is larger than 64 KiB."],
+            ],
+            after: "read",
+          },
+          error: null,
+          t3Calls: 1,
+        });
+        expect(calls).toEqual(["t3_thread_read"]);
+      }),
+    );
+
+    it.effect("refuses a call line too long to read without stopping the session", () =>
+      Effect.gen(function* () {
+        const started = yield* session();
+        const output = yield* started.evaluate({
+          tools,
+          code: [
+            `const line = '{"type":"call","evaluation":"forged","callId":999999,"tool":"t3_thread_list","args":"' + "x".repeat(2_000_000) + '"}\\n';`,
+            "const data = Buffer.from(line);",
+            "for (let at = 0; at < data.length; ) at += require('node:fs').writeSync(3, data, at);",
+            "return await t3.t3_thread_list({});",
+          ].join("\n"),
+          call: () => Effect.succeed("listed"),
+        });
+
+        expect(output).toMatchObject({ result: "listed", error: null, t3Calls: 1 });
+      }),
+    );
+
+    it.effect("stops the t3 calls an evaluation did not await once it returns", () =>
+      Effect.gen(function* () {
+        const started = yield* session();
+        const held = yield* Deferred.make<void>();
+        const stopped = yield* Deferred.make<void>();
+        const call: CodeRunner.EvaluateInput["call"] = (tool) =>
+          tool === "hold"
+            ? Deferred.succeed(held, undefined).pipe(
+                Effect.andThen(Effect.never),
+                Effect.onInterrupt(() => Deferred.succeed(stopped, undefined)),
+              )
+            : Deferred.await(held).pipe(Effect.as(null));
+        yield* started.evaluate({
+          tools: ["hold", "ready"],
+          code: "globalThis.holding = t3.hold(); await t3.ready();",
+          call,
+        });
+
+        expect(yield* Deferred.isDone(stopped)).toBe(true);
+        const later = yield* started.evaluate({
+          tools: [],
+          code: "return await holding.catch((error) => error.message);",
+          call,
+        });
+        expect(later.result).toBe(
+          "t3.hold was stopped: the evaluation that called it has finished.",
+        );
+      }),
+    );
+
     it.effect("refuses a call from a callback of an evaluation that has finished", () =>
       Effect.gen(function* () {
         const started = yield* session();
@@ -342,18 +479,28 @@ it.layer(layerTest)("CodeRunner", (it) => {
           Effect.sync(() => (calls.push(tool), null));
         yield* started.evaluate({
           tools,
-          code: "globalThis.ticked = new Promise((resolve) => setInterval(() => { if (globalThis.armed) t3.t3_thread_list({}).then(() => resolve('ran'), (error) => resolve(error.message)); }, 5));",
+          code: [
+            "globalThis.ticked = new Promise((resolve) => {",
+            "  const timer = setInterval(() => {",
+            "    if (!globalThis.armed) return;",
+            "    clearInterval(timer);",
+            "    t3.t3_thread_list({});",
+            "    t3.t3_thread_list({}).then(() => resolve('ran'), (error) => resolve(error.message));",
+            "  }, 5);",
+            "});",
+          ].join("\n"),
           call,
         });
+        // The first late call has no rejection handler, which must not end the session.
         const output = yield* started.evaluate({
           tools,
-          code: "globalThis.armed = true; return await ticked;",
+          code: "globalThis.armed = true; const message = await ticked; await new Promise((resolve) => setImmediate(resolve)); return message;",
           call,
         });
 
-        expect(output.result).toBe(
-          "t3.t3_thread_list was called by an evaluation that has already finished.",
-        );
+        const refused = "t3.t3_thread_list was called by an evaluation that has already finished.";
+        expect(output).toMatchObject({ result: refused, error: null });
+        expect(output.stderr).toContain(`Unhandled rejection: T3ToolError: ${refused}`);
         expect(calls).toEqual([]);
       }),
     );

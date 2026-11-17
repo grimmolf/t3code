@@ -7,6 +7,7 @@
 export const CODE_RUNNER_SCRIPT = String.raw`"use strict";
 delete process.env.ELECTRON_RUN_AS_NODE;
 const fs = require("node:fs");
+const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
@@ -15,6 +16,9 @@ const { createRequire } = require("node:module");
 const { AsyncLocalStorage } = require("node:async_hooks");
 
 const RESULT_LIMIT = 64 * 1024;
+const CALL_LIMIT = 64 * 1024;
+// What $ keeps of each stream a command writes: the end, where errors and summaries land.
+const SHELL_OUTPUT_LIMIT = 8 * 1024 * 1024;
 
 const quote = (value) => {
   if (Array.isArray(value)) return value.map(quote).join(" ");
@@ -31,6 +35,28 @@ class ShellError extends Error {
   }
 }
 
+const collect = (stream) => {
+  const kept = { chunks: [], bytes: 0, cut: false };
+  stream.on("data", (chunk) => {
+    kept.chunks.push(chunk);
+    kept.bytes += chunk.length;
+    while (kept.bytes - kept.chunks[0].length >= SHELL_OUTPUT_LIMIT) {
+      kept.bytes -= kept.chunks.shift().length;
+      kept.cut = true;
+    }
+  });
+  return kept;
+};
+
+const tail = (kept) => {
+  const whole = Buffer.concat(kept.chunks);
+  if (whole.length <= SHELL_OUTPUT_LIMIT) return whole.toString("utf8");
+  kept.cut = true;
+  let start = whole.length - SHELL_OUTPUT_LIMIT;
+  while (start < whole.length && (whole[start] & 0xc0) === 0x80) start++;
+  return whole.subarray(start).toString("utf8");
+};
+
 const $ = (strings, ...values) => {
   if (!Array.isArray(strings) || !Array.isArray(strings.raw)) {
     const tick = String.fromCharCode(96);
@@ -40,20 +66,22 @@ const $ = (strings, ...values) => {
     (text, part, index) => text + part + (index < values.length ? quote(values[index]) : ""),
     "",
   );
+  const running = evaluation.getStore();
   const finished = new Promise((resolve) => {
     const child = childProcess.spawn("/bin/sh", ["-c", command], { stdio: ["ignore", "pipe", "pipe"] });
-    const stdout = [];
-    const stderr = [];
-    child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.on("error", (error) => resolve({ stdout: "", stderr: error.message, exitCode: 127 }));
-    child.on("close", (code, signal) =>
-      resolve({
-        stdout: Buffer.concat(stdout).toString("utf8"),
-        stderr: Buffer.concat(stderr).toString("utf8"),
+    const stdout = collect(child.stdout);
+    const stderr = collect(child.stderr);
+    child.on("error", (error) => resolve({ stdout: "", stderr: error.message, exitCode: 127, truncated: false }));
+    child.on("close", (code, signal) => {
+      const result = {
+        stdout: tail(stdout),
+        stderr: tail(stderr),
         exitCode: code ?? 128 + (os.constants.signals[signal] ?? 0),
-      }),
-    );
+        truncated: stdout.cut || stderr.cut,
+      };
+      if (result.truncated && running !== undefined) running.truncated = true;
+      resolve(result);
+    });
   });
   let check = true;
   const settled = () =>
@@ -93,6 +121,14 @@ const writeOut = process.stdout.write.bind(process.stdout);
 const writeErr = process.stderr.write.bind(process.stderr);
 const mark = (write, marker) => new Promise((resolve) => write(marker, () => resolve()));
 
+// As in Node's REPL, an error no caller can catch goes to stderr and the session keeps running.
+const report = (label) => (error) => {
+  writeErr(label + ": " + (error instanceof Error ? (error.stack ?? error.message) : String(error)) + "\n");
+};
+process.on("uncaughtException", report("Uncaught error"));
+process.on("unhandledRejection", report("Unhandled rejection"));
+
+// Holds the running evaluation's id, and whether a $ command's output was cut.
 const evaluation = new AsyncLocalStorage();
 const pending = new Map();
 let nextCallId = 0;
@@ -107,14 +143,29 @@ class T3ToolError extends Error {
 }
 
 const call = (tool, args) => {
-  const id = evaluation.getStore();
-  if (id === undefined) {
+  const running = evaluation.getStore();
+  if (running === undefined) {
     return Promise.reject(new T3ToolError(tool, "t3." + tool + " was called outside a running evaluation."));
   }
+  let encoded;
+  try {
+    encoded = JSON.stringify(args === undefined ? {} : args);
+  } catch (error) {
+    return Promise.reject(new T3ToolError(tool, "t3." + tool + ": its arguments cannot be sent as JSON: " + error.message));
+  }
+  if (encoded === undefined) {
+    return Promise.reject(new T3ToolError(tool, "t3." + tool + ": its arguments cannot be sent as JSON."));
+  }
   const callId = ++nextCallId;
+  // T3 reads callId and tool from the start of a line too long to parse, so they precede args.
+  const line = '{"type":"call","evaluation":' + JSON.stringify(running.id) + ',"callId":' + callId +
+    ',"tool":' + JSON.stringify(tool) + ',"args":' + encoded + "}\n";
+  if (Buffer.byteLength(line) > CALL_LIMIT) {
+    return Promise.reject(new T3ToolError(tool, "t3." + tool + ": the request is larger than 64 KiB."));
+  }
   return new Promise((resolve, reject) => {
     pending.set(callId, { tool, resolve, reject });
-    send({ type: "call", evaluation: id, callId, tool, args: args === undefined ? {} : args });
+    channel.write(line);
   });
 };
 
@@ -133,11 +184,12 @@ const scriptRequire = createRequire(path.join(process.cwd(), "t3-code-run.js"));
 const cut = (text) => (text.length > RESULT_LIMIT ? { text: text.slice(0, RESULT_LIMIT), cut: true } : { text, cut: false });
 
 const evaluate = async ({ id, code, marker, tools }) => {
+  const running = { id, truncated: false };
   let message;
   try {
     // An inner function lets the script declare its own fs, $, edit, require or t3.
     const script = new AsyncFunction("$", "edit", "require", "fs", "t3", "return (async () => {\n" + code + "\n})();");
-    const value = await evaluation.run(id, () => script($, edit, scriptRequire, scriptFs, toolsOf(tools)));
+    const value = await evaluation.run(running, () => script($, edit, scriptRequire, scriptFs, toolsOf(tools)));
     let json;
     try {
       json = JSON.stringify(value);
@@ -151,7 +203,7 @@ const evaluate = async ({ id, code, marker, tools }) => {
     message = { type: "result", id, error: text.text, cut: text.cut };
   }
   await Promise.all([mark(writeOut, marker), mark(writeErr, marker)]);
-  await send(message);
+  await send({ ...message, shellTruncated: running.truncated });
 };
 
 const reply = ({ callId, ok, value, message, code }) => {
@@ -162,7 +214,9 @@ const reply = ({ callId, ok, value, message, code }) => {
   else waiting.reject(new T3ToolError(waiting.tool, message, code));
 };
 
-const lines = readline.createInterface({ input: fs.createReadStream("", { fd: 4 }), crlfDelay: Infinity });
+// A socket, not fs.createReadStream: a pending fs read on fd 4 keeps process.exit from exiting.
+const input = new net.Socket({ fd: 4, readable: true, writable: false });
+const lines = readline.createInterface({ input, crlfDelay: Infinity });
 lines.on("line", (line) => {
   const message = JSON.parse(line);
   if (message.type === "evaluate") void evaluate(message);

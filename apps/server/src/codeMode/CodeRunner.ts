@@ -247,12 +247,16 @@ interface Settled {
   readonly shellTruncated: boolean;
 }
 
-/** One evaluation's share of stdout or stderr: what arrived before its marker. */
-interface Capture {
-  readonly marker: string;
+/** Output kept so far, at most `RESPONSE_LIMIT_BYTES` of it. */
+interface Kept {
   text: string;
   bytes: number;
   truncated: boolean;
+}
+
+/** One evaluation's share of stdout or stderr: what arrived before its marker. */
+interface Capture extends Kept {
+  readonly marker: string;
   readonly seen: Deferred.Deferred<void>;
 }
 
@@ -268,55 +272,69 @@ interface Running {
   calls: number;
 }
 
-const append = (capture: Capture, text: string) => {
-  if (capture.truncated || text === "") return;
+const append = (kept: Kept, text: string) => {
+  if (kept.truncated || text === "") return;
   const bytes = Buffer.from(text);
-  const room = RESPONSE_LIMIT_BYTES - capture.bytes;
+  const room = RESPONSE_LIMIT_BYTES - kept.bytes;
   if (bytes.length > room) {
-    capture.text += bytes.subarray(0, room).toString("utf8");
-    capture.bytes = RESPONSE_LIMIT_BYTES;
-    capture.truncated = true;
+    kept.text += bytes.subarray(0, room).toString("utf8");
+    kept.bytes = RESPONSE_LIMIT_BYTES;
+    kept.truncated = true;
     return;
   }
-  capture.text += text;
-  capture.bytes += bytes.length;
+  kept.text += text;
+  kept.bytes += bytes.length;
 };
 
 /**
  * Hands each running evaluation what its process writes before the evaluation's marker.
- * Output between evaluations has no owner and is dropped.
+ * What arrives between evaluations is kept for the next one when `keepsUnowned` is set,
+ * and dropped otherwise.
+ * @internal Exported for tests.
  */
-const makeOutput = () => {
+export const makeOutput = (keepsUnowned: boolean) => {
   const decoder = new TextDecoder();
   let capture: Capture | undefined;
   let carry = "";
+  const unowned: Kept = { text: "", bytes: 0, truncated: false };
+  const keep = (text: string) => {
+    if (keepsUnowned) append(unowned, text);
+  };
+  /** Moves what arrived with no evaluation to own it onto the end of `into`. */
+  const claim = (into: Kept) => {
+    append(into, unowned.text);
+    if (unowned.truncated) into.truncated = true;
+    Object.assign(unowned, { text: "", bytes: 0, truncated: false });
+  };
   return {
     install: (next: Capture) => {
       capture = next;
       carry = "";
+      claim(next);
     },
     feed: (chunk: Uint8Array) => {
       const text = carry + decoder.decode(chunk, { stream: true });
       carry = "";
       const owner = capture;
-      if (owner === undefined) return;
+      if (owner === undefined) return keep(text);
       const at = text.indexOf(owner.marker);
       if (at !== -1) {
         append(owner, text.slice(0, at));
         capture = undefined;
         Deferred.doneUnsafe(owner.seen, Effect.void);
-        return;
+        return keep(text.slice(at + owner.marker.length));
       }
       // Holds back what could be the start of a marker split across chunks.
-      const keep = Math.min(text.length, owner.marker.length - 1);
-      append(owner, text.slice(0, text.length - keep));
-      carry = text.slice(text.length - keep);
+      const held = Math.min(text.length, owner.marker.length - 1);
+      append(owner, text.slice(0, text.length - held));
+      carry = text.slice(text.length - held);
     },
     /** Hands over what was held back, once no marker can follow it. */
     flush: () => {
       const rest = carry + decoder.decode();
       carry = "";
       if (capture !== undefined) append(capture, rest);
+      else keep(rest);
     },
   };
 };
@@ -365,8 +383,9 @@ const make = Effect.gen(function* () {
     let endReason: string | undefined;
     let current: Running | undefined;
     const exited = yield* Deferred.make<string>();
-    const stdout = makeOutput();
-    const stderr = makeOutput();
+    const stdout = makeOutput(false);
+    // An error a callback throws between evaluations is worth showing the next one.
+    const stderr = makeOutput(true);
     const stdoutClosed = yield* Deferred.make<void>();
     const stderrClosed = yield* Deferred.make<void>();
     const send = (message: typeof ToChild.Type) =>

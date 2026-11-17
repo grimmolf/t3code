@@ -284,6 +284,32 @@ it.layer(layerTest)("CodeRunner", (it) => {
     }),
   );
 
+  it("gives the next evaluation's stderr what arrived between evaluations, within the cap", () => {
+    const stderr = CodeRunner.makeOutput(true);
+    const capture = (marker: string) => ({
+      marker,
+      text: "",
+      bytes: 0,
+      truncated: false,
+      seen: Deferred.makeUnsafe<void>(),
+    });
+    const feed = (text: string) => stderr.feed(new TextEncoder().encode(text));
+
+    const first = capture("<1>");
+    stderr.install(first);
+    feed("one<1>after");
+    feed(" between");
+    const second = capture("<2>");
+    stderr.install(second);
+    feed(" two<2>");
+    feed("x".repeat(CodeRunner.RESPONSE_LIMIT_BYTES + 1));
+    const third = capture("<3>");
+    stderr.install(third);
+
+    expect([first.text, second.text]).toEqual(["one", "after between two"]);
+    expect(third).toMatchObject({ bytes: CodeRunner.RESPONSE_LIMIT_BYTES, truncated: true });
+  });
+
   describe("session", () => {
     it.effect("keeps globalThis between evaluations, and each one's own output", () =>
       Effect.gen(function* () {

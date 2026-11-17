@@ -117,18 +117,26 @@ const edit = (file, oldText, newText) => {
   fs.writeFileSync(target, text.replace(oldText, () => String(newText)));
 };
 
-const channel = fs.createWriteStream("", { fd: 3 });
-const send = (message) => new Promise((resolve) => channel.write(JSON.stringify(message) + "\n", resolve));
 const writeOut = process.stdout.write.bind(process.stdout);
 const writeErr = process.stderr.write.bind(process.stderr);
 const mark = (write, marker) => new Promise((resolve) => write(marker, () => resolve()));
+const describe = (error) => (error instanceof Error ? (error.stack ?? error.message) : String(error));
 
-// As in Node's REPL, an error no caller can catch goes to stderr and the session keeps running.
+// As in Node's REPL, an error no caller of a script's callback can catch goes to stderr and the
+// session keeps running.
 const report = (label) => (error) => {
-  writeErr(label + ": " + (error instanceof Error ? (error.stack ?? error.message) : String(error)) + "\n");
+  writeErr(label + ": " + describe(error) + "\n");
 };
 process.on("uncaughtException", report("Uncaught error"));
 process.on("unhandledRejection", report("Unhandled rejection"));
+// The runner's own failures end the session, so T3 reports them instead of waiting for a result.
+const fail = (error) => {
+  writeErr("T3's code runner failed: " + describe(error) + "\n", () => process.exit(70));
+};
+
+const channel = fs.createWriteStream("", { fd: 3 });
+channel.on("error", fail);
+const send = (message) => new Promise((resolve) => channel.write(JSON.stringify(message) + "\n", resolve));
 
 // Holds the running evaluation's id, and whether a $ command's output was cut.
 const evaluation = new AsyncLocalStorage();
@@ -201,7 +209,7 @@ const evaluate = async ({ id, code, marker, tools }) => {
     const result = cut(json === undefined ? "null" : json);
     message = { type: "result", id, json: result.text, cut: result.cut };
   } catch (error) {
-    const text = cut(error instanceof Error ? (error.stack ?? error.message) : String(error));
+    const text = cut(describe(error));
     message = { type: "result", id, error: text.text, cut: text.cut };
   }
   await Promise.all([mark(writeOut, marker), mark(writeErr, marker)]);
@@ -220,9 +228,13 @@ const reply = ({ callId, ok, value, message, code }) => {
 const input = new net.Socket({ fd: 4, readable: true, writable: false });
 const lines = readline.createInterface({ input, crlfDelay: Infinity });
 lines.on("line", (line) => {
-  const message = JSON.parse(line);
-  if (message.type === "evaluate") void evaluate(message);
-  else if (message.type === "reply") reply(message);
+  try {
+    const message = JSON.parse(line);
+    if (message.type === "evaluate") evaluate(message).catch(fail);
+    else if (message.type === "reply") reply(message);
+  } catch (error) {
+    fail(error);
+  }
 });
 lines.on("close", () => process.exit(0));
 }

@@ -336,6 +336,7 @@ export const makeOutput = (keepsUnowned: boolean) => {
       if (capture !== undefined) append(capture, rest);
       else keep(rest);
     },
+    claim,
   };
 };
 type Output = ReturnType<typeof makeOutput>;
@@ -604,6 +605,8 @@ const make = Effect.gen(function* () {
         stdout.flush();
         stderr.flush();
       }
+      // Written after its marker, such as why the runner failed, but before its process died.
+      if (Option.isNone(settled)) stderr.claim(running.stderr);
       return fitResponse({
         resultJson: Option.isSome(settled) ? settled.value.resultJson : null,
         resultCut: Option.isSome(settled) && settled.value.cut && settled.value.resultJson !== null,

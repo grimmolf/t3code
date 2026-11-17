@@ -333,21 +333,35 @@ it.layer(layerTest)("CodeRunner", (it) => {
       }),
     );
 
-    it.effect("returns at once, with what it wrote last, when a script exits the process", () =>
-      Effect.gen(function* () {
-        const started = yield* session();
-        const output = yield* started.evaluate({
-          code: `await new Promise((resolve) => process.stdout.write("bye\\n", resolve)); process.exit(7);`,
-          tools: [],
-          call: noCalls,
-        });
+    it.effect(
+      "returns at once, with what it wrote last, when a script exits the process or breaks the runner",
+      () =>
+        Effect.gen(function* () {
+          const started = yield* session();
+          const output = yield* started.evaluate({
+            code: `await new Promise((resolve) => process.stdout.write("bye\\n", resolve)); process.exit(7);`,
+            tools: [],
+            call: noCalls,
+          });
 
-        expect(output).toMatchObject({
-          stdout: "bye\n",
-          error: "The session's process exited with code 7.",
-        });
-        expect(yield* started.ended).toBe("The session's process exited with code 7.");
-      }),
+          expect(output).toMatchObject({
+            stdout: "bye\n",
+            error: "The session's process exited with code 7.",
+          });
+          expect(yield* started.ended).toBe("The session's process exited with code 7.");
+
+          // The runner cannot describe what was thrown, or its channel to T3 is gone.
+          for (const [code, failure] of [
+            ["throw Object.create(null);", "TypeError: Cannot convert object to primitive value"],
+            ["require('node:fs').closeSync(3); return 1;", "Error: EBADF"],
+          ] as const) {
+            const broken = yield* session();
+            expect(yield* broken.evaluate({ code, tools: [], call: noCalls })).toMatchObject({
+              error: "The session's process exited with code 70.",
+              stderr: expect.stringContaining(`T3's code runner failed: ${failure}`),
+            });
+          }
+        }),
     );
 
     it.effect("keeps the session when a callback throws, and writes the error to stderr", () =>

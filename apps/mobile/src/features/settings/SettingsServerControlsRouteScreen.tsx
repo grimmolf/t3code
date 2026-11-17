@@ -396,6 +396,27 @@ function ServerSettingsDetail(props: { readonly page: SettingsPage }) {
                     onValueChange={(value) => write({ enableAgentBrowserAccess: value })}
                   />
                 </SettingsSection>
+                <SettingsSection title="Agent tools">
+                  <SettingsSwitchRow
+                    icon="chevron.left.forwardslash.chevron.right"
+                    label="Code Mode (experimental)"
+                    subtitle={managedSubtitle(
+                      "codeModeEnabled",
+                      projectSelected
+                        ? "Environment-wide setting. Select All projects to change it."
+                        : "Agents run one JavaScript program per call, outside provider rules and hooks. Supervised and Auto-accept edits ask first; Allow for this thread lasts for the thread. Not available on Windows yet.",
+                    )}
+                    value={uniform("codeModeEnabled")}
+                    disabled={
+                      disabledFor("codeModeEnabled") ||
+                      targets.every(
+                        (target) =>
+                          target.environment.serverConfig.environment.platform.os === "windows",
+                      )
+                    }
+                    onValueChange={(value) => write({ codeModeEnabled: value })}
+                  />
+                </SettingsSection>
                 <AutoSettleSettingsRows write={write} pending={pendingWrites > 0} />
               </>
             ) : null}

@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { classifyToolActivity, dynamicToolSurface, mergeToolActivityData } from "./toolActivity.ts";
+import {
+  classifyToolActivity,
+  dynamicToolSurface,
+  dynamicToolTitle,
+  isJavaScriptReplTool,
+  mergeToolActivityData,
+} from "./toolActivity.ts";
 
 describe("toolActivity", () => {
   it("classifies from kind and toolName without sniffing titles", () => {
@@ -44,5 +50,30 @@ describe("toolActivity", () => {
       expect(dynamicToolSurface(name, { code: "await fs.readFile(path);" })).toBeUndefined();
     }
     expect(dynamicToolSurface("github.js", { code: "await sky.click(app);" })).toBeUndefined();
+  });
+
+  it("presents T3's code tools as JavaScript rows under the names providers report", () => {
+    const titles = {
+      t3_code_run: "Run JavaScript",
+      t3_code_poll: "Check JavaScript",
+      t3_code_reset: "Reset JavaScript",
+    };
+    for (const [tool, title] of Object.entries(titles)) {
+      for (const name of [
+        `mcp__t3-code__${tool}`,
+        `t3-code.${tool}`,
+        `t3-code-direct.${tool}`,
+        `t3-code · ${tool}`,
+        `t3-code-thread_opencode2-adapter_${tool}`,
+      ]) {
+        expect(isJavaScriptReplTool(name), name).toBe(true);
+        expect(dynamicToolTitle(name, {}), name).toBe(title);
+        expect(dynamicToolSurface(name, { code: "await sky.click(app);" })).toBeUndefined();
+      }
+      expect(isJavaScriptReplTool(`mcp__github__${tool}`)).toBe(false);
+    }
+    expect(
+      dynamicToolTitle("t3-code.t3_code_run", { code: "return 1", title: "Rename helpers" }),
+    ).toBe("Rename helpers");
   });
 });

@@ -5,6 +5,9 @@ import * as Digest from "effect/crypto/Digest";
 import * as SecureRandom from "effect/crypto/SecureRandom";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as PubSub from "effect/PubSub";
+import type * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
@@ -35,6 +38,14 @@ export interface McpSessionRegistryShape {
   readonly revokeProviderSession: (providerSessionId: string) => Effect.Effect<void>;
   readonly revokeThread: (threadId: ThreadId) => Effect.Effect<void>;
   readonly revokeAll: Effect.Effect<void>;
+  /** Whether the credential with this `providerSessionId` is still issued, not revoked. */
+  readonly isIssued: (providerSessionId: string) => Effect.Effect<boolean>;
+  /** Each credential `revokeThread` or `revokeProviderSession` revokes, from subscription on. */
+  readonly subscribeRevocations: Effect.Effect<
+    Stream.Stream<McpInvocationContext.McpThreadCaller>,
+    never,
+    Scope.Scope
+  >;
 }
 
 export class McpSessionRegistry extends Context.Service<
@@ -96,6 +107,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const environmentId = yield* environment.getEnvironmentId;
   const httpServer = yield* HttpServer.HttpServer;
   const state = yield* SynchronizedRef.make<RegistryState>({ records: new Map() });
+  const revoked = yield* PubSub.unbounded<McpInvocationContext.McpThreadCaller>();
   const { now } = options;
   const currentAliveMark: Effect.Effect<AliveMark> = now
     ? Effect.sync(() => {
@@ -199,9 +211,21 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   );
 
   const revokeWhere = (predicate: (record: CredentialRecord) => boolean) =>
-    SynchronizedRef.update(state, ({ records }) => ({
-      records: new Map(Array.from(records).filter(([, record]) => !predicate(record))),
-    }));
+    SynchronizedRef.modify(state, ({ records }) => {
+      const removed = Array.from(records.values()).filter(predicate);
+      return [
+        removed,
+        { records: new Map(Array.from(records).filter(([, record]) => !predicate(record))) },
+      ] as const;
+    }).pipe(
+      Effect.flatMap((removed) =>
+        PubSub.publishAll(
+          revoked,
+          removed.map((record) => record.scope.thread),
+        ),
+      ),
+      Effect.asVoid,
+    );
 
   return McpSessionRegistry.of({
     issue,
@@ -216,6 +240,13 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       yield* revokeWhere((record) => record.scope.thread.threadId === threadId);
     }),
     revokeAll: SynchronizedRef.set(state, { records: new Map() }),
+    isIssued: Effect.fn("McpSessionRegistry.isIssued")(function* (providerSessionId) {
+      const { records } = yield* SynchronizedRef.get(state);
+      return Array.from(records.values()).some(
+        (record) => record.scope.thread.providerSessionId === providerSessionId,
+      );
+    }),
+    subscribeRevocations: PubSub.subscribe(revoked).pipe(Effect.map(Stream.fromSubscription)),
   });
 });
 

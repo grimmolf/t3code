@@ -63,14 +63,16 @@ Codex gets T3's MCP server in each thread's `thread/start`, `thread/resume`,
 and `thread/fork` config, with the provider-session token in an
 `Authorization` header. The same server is registered twice:
 
-- `t3-code`: every tool except `t3_thread_wait` and `delegate_task`.
-- `t3-code-direct`: only `t3_thread_wait` and `delegate_task`, with
+- `t3-code`: every tool except `t3_thread_wait`, `delegate_task`, and T3's
+  code tools (`t3_code_run`, `t3_code_poll`, `t3_code_reset`).
+- `t3-code-direct`: only those, with
   `omit_tools_from = ["code_mode", "deferred"]`.
 
-Code Mode yields a script after about 30 seconds, so the model polls a blocking
-`t3_thread_wait` or `delegate_task` with `mode: "wait"`, resending its context
-on each poll. The second entry makes both direct tool calls, like Codex's own
-wait tools. Codex reports calls as `<server>.<tool>`, so
+Codex's Code Mode yields a script after about 30 seconds, so the model polls a
+blocking `t3_thread_wait` or `delegate_task` with `mode: "wait"`, resending its
+context on each poll. The second entry makes them direct tool calls, like
+Codex's own wait tools. T3's code tools drive T3's own JavaScript session, and
+calling them from Codex's would wrap one script in another. Codex reports calls as `<server>.<tool>`, so
 `packages/shared/src/t3McpToolPresentation.ts` must resolve both server names.
 Tool display and pending-work detection depend on it.
 

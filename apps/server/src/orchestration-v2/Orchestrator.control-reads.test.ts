@@ -400,6 +400,32 @@ it.effect(
     }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect(
+  "delivers a domain event committed after subscribing, though the stream is read later",
+  () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const events = yield* orchestrator.subscribeStoredEvents;
+      const threadId = ThreadId.make("thread:subscribed-first");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create-subscribed-first"),
+        threadId,
+        projectId: ProjectId.make("project:subscribed-first"),
+        title: "Subscribed first",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const first = yield* Stream.runHead(events);
+      assert.equal(Option.getOrUndefined(first)?.event.threadId, threadId);
+    }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("marks a never-visited thread's first completion unread", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;

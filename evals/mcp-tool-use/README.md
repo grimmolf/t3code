@@ -289,6 +289,10 @@ Passes per case, main's runtime text (3 samples) → this branch's "Link every o
 
 After the change, the first reference to a file is an absolute link. The remaining failures come from two other kinds of span. Some repeat the file later as relative inline code (Sonnet's other-checkout failures). Others quote values rather than cite files, such as `main` set to `src/index.ts` or the import `./ws`. Chat still turns those spans into pills.
 
+## Code Mode cases
+
+`cases/code-mode.ndjson` checks when an agent picks `t3_code_run`, and what it does with a script that is still running. `setup.codeMode` lists the code tools (`t3_code_run`, `t3_code_poll`, `t3_code_reset`) only in these cases, on either harness. Claude gets them loaded up front, as T3 does. Codex gets them as direct functions, such as `mcp__t3_code_direct__t3_code_run`, and not from a code cell, as T3 registers them on Codex's direct-only server. The `bad` case renames a function across 12 modules and should be one script, not `sed -i` or `perl -pi` one-liners. The `guard` case runs the same rename, but the script returns `status: "running"` with a handle, and the agent should poll that handle rather than run the rename again. The control is a single edit, which should not use a script. Mocks answer each script and poll; nothing runs, so these cases measure the choice of tool, not its result. They have no recorded results yet.
+
 ## Where T3's text lives
 
 - `packages/provider-core/src/server/runtimeInstructions.ts`

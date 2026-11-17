@@ -658,6 +658,10 @@ const LOST_BACKGROUND =
   "T3 Code lost its connection to OpenCode while this subagent ran, so its result is not shown.";
 const INVENTORY_TIMEOUT = "5 seconds";
 const MCP_TOOL_RELOAD_SETTLE = "250 millis";
+// request_secret and Code Mode can hold a call for an hour, as Claude and Codex allow.
+const T3_MCP_TOOL_TIMEOUT_MS = 65 * 60 * 1_000;
+// @opencode/schema 2.0.28 defines timeout.execution; an older server may read `timeout` otherwise.
+const MCP_EXECUTION_TIMEOUT_VERSION = "2.0.28";
 const ACTIVE_CHECK_TIMEOUT = "5 seconds";
 // Other failures may still have admitted the prompt.
 const CLEAR_PROMPT_REJECTIONS: ReadonlySet<string> = new Set([
@@ -4261,6 +4265,9 @@ export const make = Effect.fn("OpenCode2Adapter.make")(function* (instanceId: Pr
               url: mcpSession!.endpoint,
               headers: { Authorization: wanted.credential },
               oauth: false,
+              ...(compareSemverVersions(connection.version, MCP_EXECUTION_TIMEOUT_VERSION) >= 0
+                ? { timeout: new Mcp.TimeoutConfig({ execution: T3_MCP_TOOL_TIMEOUT_MS }) }
+                : {}),
             }),
           })
           .pipe(

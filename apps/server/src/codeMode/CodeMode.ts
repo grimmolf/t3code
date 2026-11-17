@@ -264,7 +264,15 @@ const make = Effect.gen(function* () {
               .pipe(Effect.orElseSucceed(() => Option.none())),
           )?.workspaceRoot;
         if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
-        return yield* runner.run({ code, cwd, environment });
+        return yield* Effect.scoped(
+          runner
+            .start({ cwd, environment, tools: [] })
+            .pipe(
+              Effect.flatMap((session) =>
+                session.evaluate({ code, call: () => Effect.die("No t3 tools yet.") }),
+              ),
+            ),
+        );
       }
       const remaining = Duration.millis(Math.max(0, deadline - (yield* Clock.currentTimeMillis)));
       const asked = yield* askLocks

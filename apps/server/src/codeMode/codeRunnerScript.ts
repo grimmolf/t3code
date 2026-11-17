@@ -1,15 +1,20 @@
 /**
- * Runs as `node -e` in its own process group. It reads the script from stdin and writes one
- * message to fd 3: `R` and the return value as JSON, or `E` and the error. No `${` below: this
- * is a template literal.
+ * Runs as `node -e` in its own process group, one per session. It reads JSON lines from fd 4
+ * (`evaluate`, `reply`) and writes JSON lines to fd 3 (`result`, `call`). Each evaluation ends
+ * by writing its marker to stdout and stderr, then its result. It exits when fd 4 closes.
+ * `process.argv[1]` is the JSON list of `t3` tool names. No `${` below: this is a template literal.
  */
 export const CODE_RUNNER_SCRIPT = String.raw`"use strict";
 delete process.env.ELECTRON_RUN_AS_NODE;
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const readline = require("node:readline");
 const childProcess = require("node:child_process");
 const { createRequire } = require("node:module");
+const { AsyncLocalStorage } = require("node:async_hooks");
+
+const RESULT_LIMIT = 64 * 1024;
 
 const quote = (value) => {
   if (Array.isArray(value)) return value.map(quote).join(" ");
@@ -82,38 +87,86 @@ const edit = (file, oldText, newText) => {
   fs.writeFileSync(target, text.replace(oldText, () => String(newText)));
 };
 
-const send = (message) =>
-  new Promise((resolve, reject) => {
-    const channel = fs.createWriteStream("", { fd: 3 });
-    channel.on("error", reject);
-    channel.end(message, resolve);
-  });
-const flush = (stream) => new Promise((resolve) => stream.write("", resolve));
+const channel = fs.createWriteStream("", { fd: 3 });
+const send = (message) => new Promise((resolve) => channel.write(JSON.stringify(message) + "\n", resolve));
+const writeOut = process.stdout.write.bind(process.stdout);
+const writeErr = process.stderr.write.bind(process.stderr);
+const mark = (write, marker) => new Promise((resolve) => write(marker, () => resolve()));
 
-(async () => {
-  let code = "";
-  process.stdin.setEncoding("utf8");
-  for await (const chunk of process.stdin) code += chunk;
+const evaluation = new AsyncLocalStorage();
+const pending = new Map();
+let nextCallId = 0;
+
+class T3ToolError extends Error {
+  constructor(tool, message, code) {
+    super(message);
+    this.name = "T3ToolError";
+    this.tool = tool;
+    if (code !== undefined) this.code = code;
+  }
+}
+
+const call = (tool, args) => {
+  const id = evaluation.getStore();
+  if (id === undefined) {
+    return Promise.reject(new T3ToolError(tool, "t3." + tool + " was called outside a running evaluation."));
+  }
+  const callId = ++nextCallId;
+  return new Promise((resolve, reject) => {
+    pending.set(callId, { tool, resolve, reject });
+    send({ type: "call", evaluation: id, callId, tool, args: args === undefined ? {} : args });
+  });
+};
+
+const toolNames = JSON.parse(process.argv[1] ?? "[]");
+const t3 = Object.freeze(
+  Object.fromEntries([
+    ["tools", () => [...toolNames]],
+    ...toolNames.map((name) => [name, (args) => call(name, args)]),
+  ]),
+);
+
+const AsyncFunction = (async () => {}).constructor;
+// Promise forms of the async calls, so await fs.readFile works; sync calls stay as they are.
+const scriptFs = Object.create(fs, Object.getOwnPropertyDescriptors(fs.promises));
+const scriptRequire = createRequire(path.join(process.cwd(), "t3-code-run.js"));
+const cut = (text) => (text.length > RESULT_LIMIT ? { text: text.slice(0, RESULT_LIMIT), cut: true } : { text, cut: false });
+
+const evaluate = async ({ id, code, marker }) => {
   let message;
   try {
-    const AsyncFunction = (async () => {}).constructor;
-    // An inner function lets the script declare its own fs, $, edit or require.
-    const script = new AsyncFunction("$", "edit", "require", "fs", "return (async () => {\n" + code + "\n})();");
-    // Promise forms of the async calls, so await fs.readFile works; sync calls stay as they are.
-    const scriptFs = Object.create(fs, Object.getOwnPropertyDescriptors(fs.promises));
-    const value = await script($, edit, createRequire(path.join(process.cwd(), "t3-code-run.js")), scriptFs);
+    // An inner function lets the script declare its own fs, $, edit, require or t3.
+    const script = new AsyncFunction("$", "edit", "require", "fs", "t3", "return (async () => {\n" + code + "\n})();");
+    const value = await evaluation.run(id, () => script($, edit, scriptRequire, scriptFs, t3));
     let json;
     try {
       json = JSON.stringify(value);
     } catch (error) {
       throw new Error("The return value cannot be encoded as JSON: " + error.message);
     }
-    message = "R" + (json === undefined ? "null" : json);
+    const result = cut(json === undefined ? "null" : json);
+    message = { type: "result", id, json: result.text, cut: result.cut };
   } catch (error) {
-    message = "E" + (error instanceof Error ? (error.stack ?? error.message) : String(error));
+    const text = cut(error instanceof Error ? (error.stack ?? error.message) : String(error));
+    message = { type: "result", id, error: text.text, cut: text.cut };
   }
+  await Promise.all([mark(writeOut, marker), mark(writeErr, marker)]);
   await send(message);
-  await Promise.all([flush(process.stdout), flush(process.stderr)]);
-  process.exit(0);
-})();
+};
+
+const reply = ({ callId, ok, value, message, code }) => {
+  const waiting = pending.get(callId);
+  if (waiting === undefined) return;
+  pending.delete(callId);
+  if (ok) waiting.resolve(value);
+  else waiting.reject(new T3ToolError(waiting.tool, message, code));
+};
+
+const lines = readline.createInterface({ input: fs.createReadStream("", { fd: 4 }), crlfDelay: Infinity });
+lines.on("line", (line) => {
+  const message = JSON.parse(line);
+  if (message.type === "evaluate") void evaluate(message);
+  else if (message.type === "reply") reply(message);
+});
+lines.on("close", () => process.exit(0));
 `;

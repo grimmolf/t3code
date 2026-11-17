@@ -29,7 +29,7 @@ import { CodeRunToolkit } from "./tools.ts";
 
 const threadId = ThreadId.make("thread:code-run");
 const environment = { PATH: "/usr/bin", HOME: "/home/user" };
-const ran = { result: 12, stdout: "", stderr: "", truncated: false, error: null };
+const ran = { result: 12, stdout: "", stderr: "", truncated: false, error: null, t3Calls: 0 };
 
 const codex = ProviderInstanceId.make("codex");
 const running = {
@@ -48,7 +48,7 @@ const call = Effect.fn("call")(function* (caller: {
   readonly platform?: NodeJS.Platform;
   readonly code?: string;
 }) {
-  const runs: Array<CodeRunner.CodeRunInput> = [];
+  const runs: Array<CodeRunner.CodeSessionInput & { readonly code: string }> = [];
   const shell = { ...liveThreadShell(threadId), projectId: ProjectId.make("project:acme") };
   const layerDependencies = Layer.mergeAll(
     Layer.succeed(McpInvocationContext.McpInvocationContext, {
@@ -91,7 +91,12 @@ const call = Effect.fn("call")(function* (caller: {
           getById: () => Effect.succeedSome({ workspaceRoot: "/home/user/acme" } as Project),
         }),
         Layer.mock(CodeRunner.CodeRunner)({
-          run: (input) => Effect.sync(() => (runs.push(input), ran)),
+          start: (input) =>
+            Effect.succeed({
+              evaluate: ({ code }) => Effect.sync(() => (runs.push({ ...input, code }), ran)),
+              end: () => Effect.void,
+              ended: Effect.never,
+            }),
         }),
       ),
     ),
@@ -117,7 +122,7 @@ it.effect("runs a thread's script in its workspace with the server's environment
   Effect.gen(function* () {
     const { result, runs } = yield* call({});
     expect(result).toEqual(ran);
-    expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment }]);
+    expect(runs).toEqual([{ code: "return 12", cwd: "/home/user/acme", environment, tools: [] }]);
   }),
 );
 

@@ -21,17 +21,33 @@ const workspace = Effect.fn("workspace")(function* () {
   return yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3code-code-run-" });
 });
 
-const run = Effect.fn("run")(function* (
-  code: string,
-  options: { readonly cwd?: string; readonly environment?: NodeJS.ProcessEnv } = {},
+const noCalls: CodeRunner.EvaluateInput["call"] = () =>
+  Effect.die("This script makes no t3 calls.");
+
+/** A session in the current scope. */
+const session = Effect.fn("session")(function* (
+  options: {
+    readonly cwd?: string;
+    readonly environment?: NodeJS.ProcessEnv;
+    readonly tools?: ReadonlyArray<string>;
+  } = {},
 ) {
   const runner = yield* CodeRunner.CodeRunner;
-  return yield* runner.run({
-    code,
+  return yield* runner.start({
     cwd: options.cwd ?? (yield* workspace()),
     environment: options.environment ?? { PATH: (yield* HostProcess.Environment).PATH },
+    tools: options.tools ?? [],
   });
 });
+
+/** One evaluation in a session of its own, which ends with it. */
+const run = (
+  code: string,
+  options: { readonly cwd?: string; readonly environment?: NodeJS.ProcessEnv } = {},
+) =>
+  Effect.scoped(
+    Effect.flatMap(session(options), (started) => started.evaluate({ code, call: noCalls })),
+  );
 
 const isRunning = (pid: number) => {
   try {
@@ -79,9 +95,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
 
         const once = yield* run(
           `edit("a.ts", "one", "1"); return fs.readFileSync("a.ts", "utf8");`,
-          {
-            cwd,
-          },
+          { cwd },
         );
         expect(once).toMatchObject({ result: "1 two two\n", error: null });
 
@@ -176,7 +190,10 @@ it.layer(layerTest)("CodeRunner", (it) => {
   it.effect("stops a script at the timeout and kills what it started", () =>
     Effect.gen(function* () {
       const report = yield* pidReport();
-      const fiber = yield* run(report.script).pipe(Effect.forkChild);
+      const started = yield* session();
+      const fiber = yield* started
+        .evaluate({ code: report.script, call: noCalls })
+        .pipe(Effect.forkChild);
       const pid = yield* report.pid;
       expect(isRunning(pid)).toBe(true);
 
@@ -185,6 +202,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
 
       expect(output.error).toBe("The script ran longer than 10 minutes and was stopped.");
       expect(isRunning(pid)).toBe(false);
+      expect(yield* started.ended).toBe("The script ran longer than 10 minutes and was stopped.");
     }),
   );
 
@@ -193,7 +211,10 @@ it.layer(layerTest)("CodeRunner", (it) => {
       const report = yield* pidReport(
         `const pid = String(require("node:child_process").spawn("sleep", ["15"], { detached: true, stdio: "inherit" }).pid);`,
       );
-      const fiber = yield* run(report.script).pipe(Effect.forkChild);
+      const started = yield* session();
+      const fiber = yield* started
+        .evaluate({ code: report.script, call: noCalls })
+        .pipe(Effect.forkChild);
       const pid = yield* report.pid;
       yield* Effect.addFinalizer(() => Effect.sync(() => isRunning(pid) && process.kill(pid)));
 
@@ -207,7 +228,23 @@ it.layer(layerTest)("CodeRunner", (it) => {
     }),
   );
 
-  it.effect("kills what a script started when the call is interrupted", () =>
+  it.effect("gives a running evaluation the reason its session was ended", () =>
+    Effect.gen(function* () {
+      const report = yield* pidReport();
+      const started = yield* session();
+      const fiber = yield* started
+        .evaluate({ code: report.script, call: noCalls })
+        .pipe(Effect.forkChild);
+      const pid = yield* report.pid;
+
+      yield* started.end("Reset by t3_code_reset.");
+
+      expect((yield* Fiber.join(fiber)).error).toBe("Reset by t3_code_reset.");
+      expect(isRunning(pid)).toBe(false);
+    }),
+  );
+
+  it.effect("kills what scripts started when the session's scope closes", () =>
     Effect.gen(function* () {
       const report = yield* pidReport();
       const fiber = yield* run(report.script).pipe(Effect.forkChild);
@@ -220,7 +257,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
     }),
   );
 
-  it.effect("kills what a script left running after it returns", () =>
+  it.effect("kills what a script left running once its session ends", () =>
     Effect.gen(function* () {
       const output = yield* run(
         `return Number((await $\`sleep 300 >/dev/null 2>&1 & echo $!\`.text()).trim());`,
@@ -229,10 +266,117 @@ it.layer(layerTest)("CodeRunner", (it) => {
       expect(isRunning(output.result as number)).toBe(false);
     }),
   );
+
+  describe("session", () => {
+    it.effect("keeps globalThis between evaluations, and each one's own output", () =>
+      Effect.gen(function* () {
+        const started = yield* session();
+        const evaluate = (code: string) => started.evaluate({ code, call: noCalls });
+
+        const first = yield* evaluate(
+          `globalThis.kept = 1; var local = 2; let block = 3; function helper() {} console.log("one");`,
+        );
+        const second = yield* evaluate(
+          `console.log("two"); return [typeof kept, typeof local, typeof block, typeof helper];`,
+        );
+
+        expect(first).toMatchObject({ stdout: "one\n", error: null });
+        expect(second).toMatchObject({
+          result: ["number", "undefined", "undefined", "undefined"],
+          stdout: "two\n",
+          error: null,
+        });
+      }),
+    );
+  });
+
+  describe("t3", () => {
+    const tools = ["t3_thread_list", "t3_thread_read"];
+
+    it.effect("lists its tools, calls them, and throws their failures", () =>
+      Effect.gen(function* () {
+        const started = yield* session({ tools });
+        const calls: Array<[string, unknown]> = [];
+        const output = yield* started.evaluate({
+          code: [
+            "const threads = await t3.t3_thread_list({ limit: 2 });",
+            "const failure = await t3.t3_thread_read({ threadId: 'gone' }).catch((error) => [error.message, error.code, error.tool]);",
+            "return { tools: t3.tools(), wait: typeof t3.t3_thread_wait, threads, failure };",
+          ].join("\n"),
+          call: (tool, args) => {
+            calls.push([tool, args]);
+            return tool === "t3_thread_list"
+              ? Effect.succeed({ threads: [] })
+              : Effect.fail(
+                  new CodeRunner.CodeToolCallError({
+                    reason: "Thread gone was not found.",
+                    code: "thread_not_found",
+                  }),
+                );
+          },
+        });
+
+        expect(output).toMatchObject({
+          result: {
+            tools,
+            wait: "undefined",
+            threads: { threads: [] },
+            failure: ["Thread gone was not found.", "thread_not_found", "t3_thread_read"],
+          },
+          error: null,
+          t3Calls: 2,
+        });
+        expect(calls).toEqual([
+          ["t3_thread_list", { limit: 2 }],
+          ["t3_thread_read", { threadId: "gone" }],
+        ]);
+      }),
+    );
+
+    it.effect("refuses a call from a callback of an evaluation that has finished", () =>
+      Effect.gen(function* () {
+        const started = yield* session({ tools });
+        const calls: Array<string> = [];
+        const call: CodeRunner.EvaluateInput["call"] = (tool) =>
+          Effect.sync(() => (calls.push(tool), null));
+        yield* started.evaluate({
+          code: "globalThis.ticked = new Promise((resolve) => setInterval(() => { if (globalThis.armed) t3.t3_thread_list({}).then(() => resolve('ran'), (error) => resolve(error.message)); }, 5));",
+          call,
+        });
+        const output = yield* started.evaluate({
+          code: "globalThis.armed = true; return await ticked;",
+          call,
+        });
+
+        expect(output.result).toBe(
+          "t3.t3_thread_list was called by an evaluation that has already finished.",
+        );
+        expect(calls).toEqual([]);
+      }),
+    );
+
+    it.effect("runs at most 8 calls at once in one evaluation", () =>
+      Effect.gen(function* () {
+        const started = yield* session({ tools });
+        const output = yield* started.evaluate({
+          code: [
+            "const calls = Array.from({ length: 9 }, () => t3.t3_thread_list({}));",
+            "return await calls[8].then(() => 'ran', (error) => error.message);",
+          ].join("\n"),
+          call: () => Effect.never,
+        });
+
+        expect(output).toMatchObject({
+          result: "t3.t3_thread_list: at most 8 t3 calls can run at once in one evaluation.",
+          t3Calls: 8,
+        });
+      }),
+    );
+  });
 });
 
 // Live: the grace starts when the real process exits, which a test clock cannot observe.
-it.live("returns a script's value when a detached process it started holds the pipes", () =>
+it.live("returns a script's value while a detached process it started holds the pipes", () =>
   Effect.gen(function* () {
     const output = yield* run(
       `const child = require("node:child_process").spawn("sleep", ["15"], { detached: true, stdio: "inherit" });
@@ -244,6 +388,5 @@ it.live("returns a script's value when a detached process it started holds the p
 
     expect(value).toBe(2);
     expect(output.error).toBeNull();
-    expect(output.truncated).toBe(true);
   }).pipe(Effect.scoped, Effect.provide(layerTest)),
 );

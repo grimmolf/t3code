@@ -6,12 +6,14 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PlatformError from "effect/PlatformError";
+import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as ChildProcess from "effect/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/process/ChildProcessSpawner";
 
-import { collectUint8StreamText } from "@t3tools/provider-core/server/collectStreamText";
+import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import { CODE_RUNNER_SCRIPT } from "./codeRunnerScript.ts";
@@ -22,6 +24,8 @@ export const CodeRunOutput = Schema.Struct({
   stderr: Schema.String,
   truncated: Schema.Boolean,
   error: Schema.NullOr(Schema.String),
+  /** How many `t3.<tool>()` calls the evaluation made. */
+  t3Calls: Schema.Number,
 });
 export type CodeRunOutput = typeof CodeRunOutput.Type;
 
@@ -34,24 +38,63 @@ export class CodeRunStartError extends Schema.TaggedError<CodeRunStartError>()(
   }
 }
 
-export interface CodeRunInput {
-  readonly code: string;
-  /** Relative paths in the script resolve against it. */
+/** Why one `t3.<tool>()` call failed; the script receives it as a thrown error. */
+export class CodeToolCallError extends Schema.TaggedError<CodeToolCallError>()(
+  "CodeToolCallError",
+  { reason: Schema.String, code: Schema.optional(Schema.String) },
+) {
+  override get message(): string {
+    return this.reason;
+  }
+}
+
+export interface CodeSessionInput {
+  /** Relative paths in scripts resolve against it. */
   readonly cwd: string;
   readonly environment: NodeJS.ProcessEnv;
+  /** The names scripts can call as `t3.<name>(args)`. */
+  readonly tools: ReadonlyArray<string>;
+}
+
+export interface EvaluateInput {
+  readonly code: string;
+  /** Answers this evaluation's `t3.<tool>(args)` calls. */
+  readonly call: (tool: string, args: Schema.Json) => Effect.Effect<Schema.Json, CodeToolCallError>;
+}
+
+export interface CodeSession {
+  /** Runs one evaluation at a time. A second call while one runs dies. */
+  readonly evaluate: (input: EvaluateInput) => Effect.Effect<CodeRunOutput>;
+  /** Kills the session's process group; a running evaluation returns `reason` as its error. */
+  readonly end: (reason: string) => Effect.Effect<void>;
+  /** Succeeds with why, once the session's process has exited. */
+  readonly ended: Effect.Effect<string>;
 }
 
 export class CodeRunner extends Context.Service<
   CodeRunner,
-  { readonly run: (input: CodeRunInput) => Effect.Effect<CodeRunOutput, CodeRunStartError> }
+  {
+    readonly start: (
+      input: CodeSessionInput,
+    ) => Effect.Effect<CodeSession, CodeRunStartError, Scope.Scope>;
+  }
 >()("t3/codeMode/CodeRunner") {}
 
 export const RUN_TIMEOUT = Duration.minutes(10);
-/** How long output may keep arriving once the script ends or is stopped. */
+/** How long output may keep arriving once an evaluation returns or its process is stopped. */
 export const PIPE_GRACE = Duration.seconds(2);
 const PIPES_HELD =
   "Output was cut off because a background process the script started kept its output open.";
 export const RESPONSE_LIMIT_BYTES = 64 * 1024;
+/** Room left in the response for what Code Mode adds around an evaluation's output. */
+const ENVELOPE_BYTES = 1024;
+/** Each `t3` request and each result sent back to the script. */
+const CALL_LIMIT_BYTES = 64 * 1024;
+const CALLS_IN_FLIGHT = 8;
+/** V8's old-generation cap for each session, in MiB. */
+const SESSION_HEAP_MIB = 512;
+// A result line holds at most 64K characters of JSON, which escaping can grow several times over.
+const CHANNEL_LINE_LIMIT = 1024 * 1024;
 const TRUNCATED_MARKER = "\n[truncated]";
 
 const jsonBytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
@@ -74,19 +117,7 @@ const cutToFit = (text: string, maxBytes: number): string => {
 interface Collected {
   readonly text: string;
   readonly truncated: boolean;
-  /** The grace ran out before the stream ended. */
-  readonly heldOpen: boolean;
 }
-
-const decodeChannel = (channel: Pick<Collected, "text" | "truncated">) => {
-  const kind = channel.text.slice(0, 1);
-  const body = channel.text.slice(1);
-  return kind === "R"
-    ? { resultJson: body, error: null, cut: channel.truncated }
-    : kind === "E"
-      ? { resultJson: null, error: body, cut: channel.truncated }
-      : undefined;
-};
 
 const decodeResult = Schema.decodeUnknownOption(Schema.fromJsonString(Schema.Json));
 
@@ -100,10 +131,19 @@ const fitResponse = (input: {
   readonly error: string | null;
   readonly stdout: Collected;
   readonly stderr: Collected;
+  readonly t3Calls: number;
 }): CodeRunOutput => {
   let remaining =
     RESPONSE_LIMIT_BYTES -
-    jsonBytes({ result: null, stdout: "", stderr: "", truncated: false, error: null });
+    ENVELOPE_BYTES -
+    jsonBytes({
+      result: null,
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      error: null,
+      t3Calls: input.t3Calls,
+    });
   let truncated = input.resultCut || input.stdout.truncated || input.stderr.truncated;
   const take = (text: string, alreadyCut: boolean) => {
     const whole = alreadyCut ? text + TRUNCATED_MARKER : text;
@@ -133,10 +173,9 @@ const fitResponse = (input: {
     stdout: take(input.stdout.text, input.stdout.truncated),
     stderr: take(input.stderr.text, input.stderr.truncated),
     truncated,
+    t3Calls: input.t3Calls,
   };
 };
-
-const empty: Collected = { text: "", truncated: false, heldOpen: false };
 
 // The same prefixes the terminal keeps from shells, plus the MCP credentials.
 const isServerOnlyVariable = (name: string) => {
@@ -147,102 +186,389 @@ const isServerOnlyVariable = (name: string) => {
   );
 };
 
+const ChildMessage = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("result"),
+    id: Schema.String,
+    json: Schema.optional(Schema.String),
+    error: Schema.optional(Schema.String),
+    cut: Schema.Boolean,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("call"),
+    evaluation: Schema.String,
+    callId: Schema.Number,
+    tool: Schema.String,
+    args: Schema.Json,
+  }),
+]);
+const decodeChildMessage = Schema.decodeUnknownOption(Schema.fromJsonString(ChildMessage));
+type CallMessage = Extract<typeof ChildMessage.Type, { readonly type: "call" }>;
+
+const ToChild = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("evaluate"),
+    id: Schema.String,
+    code: Schema.String,
+    marker: Schema.String,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("reply"),
+    callId: Schema.Number,
+    ok: Schema.Literal(true),
+    value: Schema.Json,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("reply"),
+    callId: Schema.Number,
+    ok: Schema.Literal(false),
+    message: Schema.String,
+    code: Schema.optional(Schema.String),
+  }),
+]);
+const encodeToChildJson = Schema.encodeEffect(Schema.fromJsonString(ToChild));
+const encodeToolNamesJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Array(Schema.String)));
+// Every value here is already JSON, so encoding cannot fail.
+const encodeToChild = (message: typeof ToChild.Type) =>
+  encodeToChildJson(message).pipe(Effect.orDie);
+const encodeToolNames = (tools: ReadonlyArray<string>) =>
+  encodeToolNamesJson(tools).pipe(Effect.orDie);
+
+interface Settled {
+  readonly resultJson: string | null;
+  readonly error: string | null;
+  readonly cut: boolean;
+}
+
+/** One evaluation's share of stdout or stderr: what arrived before its marker. */
+interface Capture {
+  readonly marker: string;
+  text: string;
+  bytes: number;
+  truncated: boolean;
+  readonly seen: Deferred.Deferred<void>;
+}
+
+interface Running {
+  readonly id: string;
+  readonly call: EvaluateInput["call"];
+  readonly settled: Deferred.Deferred<Settled>;
+  readonly stdout: Capture;
+  readonly stderr: Capture;
+  inFlight: number;
+  calls: number;
+}
+
+const append = (capture: Capture, text: string) => {
+  if (capture.truncated || text === "") return;
+  const bytes = Buffer.from(text);
+  const room = RESPONSE_LIMIT_BYTES - capture.bytes;
+  if (bytes.length > room) {
+    capture.text += bytes.subarray(0, room).toString("utf8");
+    capture.bytes = RESPONSE_LIMIT_BYTES;
+    capture.truncated = true;
+    return;
+  }
+  capture.text += text;
+  capture.bytes += bytes.length;
+};
+
+/**
+ * Hands each running evaluation what its process writes before the evaluation's marker.
+ * Output between evaluations has no owner and is dropped.
+ */
+const makeOutput = () => {
+  const decoder = new TextDecoder();
+  let capture: Capture | undefined;
+  let carry = "";
+  return {
+    install: (next: Capture) => {
+      capture = next;
+      carry = "";
+    },
+    feed: (chunk: Uint8Array) => {
+      const text = carry + decoder.decode(chunk, { stream: true });
+      carry = "";
+      const owner = capture;
+      if (owner === undefined) return;
+      const at = text.indexOf(owner.marker);
+      if (at !== -1) {
+        append(owner, text.slice(0, at));
+        capture = undefined;
+        Deferred.doneUnsafe(owner.seen, Effect.void);
+        return;
+      }
+      // Holds back what could be the start of a marker split across chunks.
+      const keep = Math.min(text.length, owner.marker.length - 1);
+      append(owner, text.slice(0, text.length - keep));
+      carry = text.slice(text.length - keep);
+    },
+  };
+};
+
 const make = Effect.gen(function* () {
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const executablePath = yield* HostProcess.ExecutablePath;
 
-  // Every stream drains to its end even past the cap, or the runner would block on a full pipe.
-  const collect = Effect.fnUntraced(function* (
-    stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>,
-    graceOver: Deferred.Deferred<void>,
-  ) {
-    let heldOpen = false;
-    const collected = yield* collectUint8StreamText({
-      stream: stream.pipe(
-        Stream.interruptWhen(
-          Deferred.await(graceOver).pipe(Effect.tap(() => Effect.sync(() => (heldOpen = true)))),
-        ),
-      ),
-      maxBytes: RESPONSE_LIMIT_BYTES,
-    }).pipe(Effect.orElseSucceed(() => empty));
-    return {
-      text: collected.text,
-      truncated: collected.truncated || heldOpen,
-      capped: collected.truncated,
-      heldOpen,
-    };
-  });
-
-  const run = Effect.fn("CodeRunner.run")(function* (input: CodeRunInput) {
+  const start = Effect.fn("CodeRunner.start")(function* (input: CodeSessionInput) {
     const environment: NodeJS.ProcessEnv = { ELECTRON_RUN_AS_NODE: "1" };
     for (const [name, value] of Object.entries(input.environment)) {
       if (!isServerOnlyVariable(name)) environment[name] = value;
     }
-    return yield* Effect.scoped(
-      Effect.gen(function* () {
-        const handle = yield* spawner
-          .spawn(
-            ChildProcess.make(executablePath, ["-e", CODE_RUNNER_SCRIPT], {
-              cwd: input.cwd,
-              env: environment,
-              extendEnv: false,
-              killSignal: "SIGKILL",
-              additionalFds: { fd3: { type: "output" } },
+    const toolNames = yield* encodeToolNames(input.tools);
+    const toChild = yield* Queue.unbounded<string>();
+    const encoder = new TextEncoder();
+    const handle = yield* spawner
+      .spawn(
+        ChildProcess.make(
+          executablePath,
+          [`--max-old-space-size=${SESSION_HEAP_MIB}`, "-e", CODE_RUNNER_SCRIPT, toolNames],
+          {
+            cwd: input.cwd,
+            env: environment,
+            extendEnv: false,
+            killSignal: "SIGKILL",
+            stdin: "ignore",
+            additionalFds: {
+              fd3: { type: "output" },
+              fd4: {
+                type: "input",
+                stream: Stream.fromQueue(toChild).pipe(
+                  Stream.map((line) => encoder.encode(`${line}\n`)),
+                ),
+              },
+            },
+          },
+        ),
+      )
+      .pipe(
+        Effect.mapError((cause) => new CodeRunStartError({ cause })),
+        Effect.catchDefect((cause) => Effect.fail(new CodeRunStartError({ cause }))),
+      );
+
+    let endReason: string | undefined;
+    let current: Running | undefined;
+    const exited = yield* Deferred.make<string>();
+    const stdout = makeOutput();
+    const stderr = makeOutput();
+    const stdoutClosed = yield* Deferred.make<void>();
+    const stderrClosed = yield* Deferred.make<void>();
+    const send = (message: typeof ToChild.Type) =>
+      encodeToChild(message).pipe(
+        Effect.flatMap((line) => Queue.offer(toChild, line)),
+        Effect.asVoid,
+      );
+
+    const end = (reason: string) =>
+      Effect.suspend(() => {
+        endReason ??= reason;
+        return handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore);
+      });
+
+    const drain = (
+      stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>,
+      onChunk: (chunk: Uint8Array) => void,
+      closed: Deferred.Deferred<void>,
+    ) =>
+      stream.pipe(
+        Stream.runForEach((chunk) => Effect.sync(() => onChunk(chunk))),
+        Effect.ignore,
+        Effect.ensuring(Deferred.succeed(closed, undefined)),
+        Effect.forkScoped,
+      );
+
+    const refusal = (callId: number, message: string): typeof ToChild.Type => ({
+      type: "reply",
+      callId,
+      ok: false,
+      message,
+    });
+
+    // Untraced: it runs once per t3 call, inside the session's own span.
+    const answer = Effect.fnUntraced(function* (running: Running, call: CallMessage) {
+      const outcome = yield* running.call(call.tool, call.args).pipe(
+        Effect.map((value): typeof ToChild.Type => ({
+          type: "reply",
+          callId: call.callId,
+          ok: true,
+          value,
+        })),
+        Effect.catchTags({
+          CodeToolCallError: (error) =>
+            Effect.succeed<typeof ToChild.Type>({
+              ...refusal(call.callId, error.reason),
+              ...(error.code === undefined ? {} : { code: error.code }),
             }),
-          )
-          .pipe(
-            Effect.mapError((cause) => new CodeRunStartError({ cause })),
-            Effect.catchDefect((cause) => Effect.fail(new CodeRunStartError({ cause }))),
-          );
-        const graceOver = yield* Deferred.make<void>();
-        const outputs = yield* Effect.all(
-          [
-            collect(handle.stdout, graceOver),
-            collect(handle.stderr, graceOver),
-            collect(handle.getOutputFd(3), graceOver),
-          ],
-          { concurrency: "unbounded" },
-        ).pipe(Effect.forkScoped);
-        yield* Stream.run(Stream.encodeText(Stream.make(input.code)), handle.stdin).pipe(
-          Effect.ignore,
+        }),
+      );
+      const line = yield* encodeToChild(outcome);
+      yield* Buffer.byteLength(line) > CALL_LIMIT_BYTES
+        ? send(refusal(call.callId, `The result of t3.${call.tool} is larger than 64 KiB.`))
+        : Queue.offer(toChild, line);
+    });
+
+    // Untraced: it runs once per t3 call, inside the session's own span.
+    const onCall = Effect.fnUntraced(function* (line: string, call: CallMessage) {
+      const running = current;
+      if (Buffer.byteLength(line) > CALL_LIMIT_BYTES) {
+        return yield* send(
+          refusal(call.callId, `t3.${call.tool}: the request is larger than 64 KiB.`),
         );
-        const exitCode = yield* handle.exitCode.pipe(
-          Effect.option,
-          Effect.timeoutOption(RUN_TIMEOUT),
+      }
+      if (running === undefined || running.id !== call.evaluation) {
+        return yield* send(
+          refusal(
+            call.callId,
+            `t3.${call.tool} was called by an evaluation that has already finished.`,
+          ),
         );
-        // Armed before the kill, which waits on the process: a detached descendant outside its
-        // group can hold the pipes open for as long as it runs.
-        yield* Effect.sleep(PIPE_GRACE).pipe(
-          Effect.andThen(Deferred.succeed(graceOver, undefined)),
-          Effect.forkScoped,
+      }
+      if (running.inFlight >= CALLS_IN_FLIGHT) {
+        return yield* send(
+          refusal(
+            call.callId,
+            `t3.${call.tool}: at most ${CALLS_IN_FLIGHT} t3 calls can run at once in one evaluation.`,
+          ),
         );
-        yield* handle.kill({ killSignal: "SIGKILL" }).pipe(Effect.ignore);
-        const [stdout, stderr, channel] = yield* Fiber.join(outputs);
-        // The runner writes its one message before it exits, so only the byte cap can cut it.
-        const message = decodeChannel({ text: channel.text, truncated: channel.capped });
-        const ended = Option.isNone(exitCode)
-          ? `The script ran longer than ${Duration.toMinutes(RUN_TIMEOUT)} minutes and was stopped.`
-          : message === undefined
-            ? `The script exited${Option.match(exitCode.value, {
-                onNone: () => "",
-                onSome: (code) => ` with code ${code}`,
-              })} before returning.`
-            : message.error;
-        const heldOpen = stdout.heldOpen || stderr.heldOpen || channel.heldOpen;
-        // A script that returned succeeded; `truncated` alone says its output was cut.
-        const error = heldOpen && ended !== null ? `${ended}\n${PIPES_HELD}` : ended;
-        return fitResponse({
-          resultJson: Option.isNone(exitCode) ? null : (message?.resultJson ?? null),
-          resultCut: message?.cut === true && message.resultJson !== null,
-          error,
-          stdout,
-          stderr,
-        });
-      }),
+      }
+      running.inFlight += 1;
+      running.calls += 1;
+      yield* answer(running, call).pipe(
+        Effect.ensuring(Effect.sync(() => (running.inFlight -= 1))),
+        Effect.forkScoped,
+      );
+    });
+
+    const unreadable = "The session wrote a message T3 could not read, so it was stopped.";
+    let pending = "";
+    const channelDecoder = new TextDecoder();
+    // Untraced: it runs once per chunk the session writes to its channel.
+    const onChannel = Effect.fnUntraced(function* (chunk: Uint8Array) {
+      pending += channelDecoder.decode(chunk, { stream: true });
+      let newline = pending.indexOf("\n");
+      while (newline !== -1) {
+        const line = pending.slice(0, newline);
+        pending = pending.slice(newline + 1);
+        newline = pending.indexOf("\n");
+        const message = decodeChildMessage(line);
+        if (Option.isNone(message)) return yield* end(unreadable);
+        if (message.value.type === "call") {
+          yield* onCall(line, message.value);
+          continue;
+        }
+        const result = message.value;
+        if (current?.id === result.id) {
+          yield* Deferred.succeed(current.settled, {
+            resultJson: result.json ?? null,
+            error: result.error ?? null,
+            cut: result.cut,
+          });
+        }
+      }
+      if (pending.length > CHANNEL_LINE_LIMIT) yield* end(unreadable);
+    });
+
+    yield* drain(handle.stdout, stdout.feed, stdoutClosed);
+    yield* drain(handle.stderr, stderr.feed, stderrClosed);
+    yield* handle
+      .getOutputFd(3)
+      .pipe(Stream.runForEach(onChannel), Effect.ignore, Effect.forkScoped);
+    yield* handle.exitCode.pipe(
+      Effect.option,
+      Effect.flatMap((code) =>
+        Deferred.succeed(
+          exited,
+          endReason ??
+            `The session's process exited${Option.match(code, {
+              onNone: () => "",
+              onSome: (exitCode) => ` with code ${exitCode}`,
+            })}.`,
+        ),
+      ),
+      Effect.forkScoped,
     );
+
+    const graceOver = <A>(effect: Effect.Effect<A>) =>
+      effect.pipe(Effect.timeoutOption(PIPE_GRACE), Effect.map(Option.isNone));
+
+    const evaluate = Effect.fn("CodeSession.evaluate")(function* (evaluation: EvaluateInput) {
+      if (current !== undefined) return yield* Effect.die("A code session runs one evaluation.");
+      const capture = () => ({
+        marker: `\u0000t3-evaluation-end:${id}\u0000`,
+        text: "",
+        bytes: 0,
+        truncated: false,
+        seen: Deferred.makeUnsafe<void>(),
+      });
+      const id = yield* randomUuidV4;
+      const running: Running = {
+        id,
+        call: evaluation.call,
+        settled: yield* Deferred.make<Settled>(),
+        stdout: capture(),
+        stderr: capture(),
+        inFlight: 0,
+        calls: 0,
+      };
+      current = running;
+      stdout.install(running.stdout);
+      stderr.install(running.stderr);
+      yield* send({ type: "evaluate", id, code: evaluation.code, marker: running.stdout.marker });
+      const outcome = yield* Deferred.await(running.settled).pipe(
+        Effect.asSome,
+        Effect.raceFirst(Deferred.await(exited).pipe(Effect.as(Option.none<Settled>()))),
+        Effect.timeoutOption(RUN_TIMEOUT),
+      );
+      const pipesClosed = graceOver(
+        Effect.all([Deferred.await(stdoutClosed), Deferred.await(stderrClosed)]),
+      );
+      // Armed before the kill, which waits on the process: a detached descendant outside its
+      // group can hold the pipes open for as long as it runs.
+      const timedOutGrace = Option.isNone(outcome)
+        ? yield* pipesClosed.pipe(Effect.forkChild({ startImmediately: true }))
+        : undefined;
+      if (timedOutGrace !== undefined) {
+        yield* end(
+          `The script ran longer than ${Duration.toMinutes(RUN_TIMEOUT)} minutes and was stopped.`,
+        );
+      }
+      const settled = Option.flatten(outcome);
+      let error: string | null;
+      let heldOpen = false;
+      let unmarked = false;
+      if (Option.isSome(settled)) {
+        unmarked = yield* graceOver(
+          Effect.all([Deferred.await(running.stdout.seen), Deferred.await(running.stderr.seen)]),
+        );
+        error = settled.value.error;
+      } else {
+        heldOpen =
+          timedOutGrace === undefined ? yield* pipesClosed : yield* Fiber.join(timedOutGrace);
+        const reason = yield* Deferred.await(exited);
+        error = heldOpen ? `${reason}\n${PIPES_HELD}` : reason;
+      }
+      current = undefined;
+      return fitResponse({
+        resultJson: Option.isSome(settled) ? settled.value.resultJson : null,
+        resultCut: Option.isSome(settled) && settled.value.cut && settled.value.resultJson !== null,
+        error,
+        stdout: {
+          text: running.stdout.text,
+          truncated: running.stdout.truncated || heldOpen || unmarked,
+        },
+        stderr: { text: running.stderr.text, truncated: running.stderr.truncated || heldOpen },
+        t3Calls: running.calls,
+      });
+    });
+
+    return {
+      evaluate,
+      end,
+      ended: Deferred.await(exited),
+    } satisfies CodeSession;
   });
 
-  return CodeRunner.of({ run });
+  return CodeRunner.of({ start });
 });
 
 export const layer = Layer.effect(CodeRunner, make);

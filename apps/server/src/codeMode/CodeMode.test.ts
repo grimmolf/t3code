@@ -78,7 +78,7 @@ const layerTest = ThreadManagementService.layer.pipe(
   Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
 );
 
-const ran = { result: null, stdout: "", stderr: "", truncated: false, error: null };
+const ran = { result: null, stdout: "", stderr: "", truncated: false, error: null, t3Calls: 0 };
 
 /** A thread whose turn is running on a session no process holds. */
 const startTurn = Effect.fn("startTurn")(function* (
@@ -308,7 +308,12 @@ const withCodeMode = <A, E, R>(
               getInstance: (id) => Effect.succeed(id === instanceId ? instance : undefined),
             }),
             Layer.mock(CodeRunner.CodeRunner)({
-              run: (input) => Effect.sync(() => (runs.push(input.code), ran)),
+              start: () =>
+                Effect.succeed({
+                  evaluate: (input) => Effect.sync(() => (runs.push(input.code), ran)),
+                  end: () => Effect.void,
+                  ended: Effect.never,
+                }),
             }),
           ),
         ),

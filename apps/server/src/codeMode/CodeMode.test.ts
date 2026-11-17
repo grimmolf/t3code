@@ -34,6 +34,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import type * as Cause from "effect/Cause";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -86,6 +87,8 @@ const layerTest = ThreadManagementService.layer.pipe(
 );
 
 const ran = { result: null, stdout: "", stderr: "", truncated: false, error: null, t3Calls: 0 };
+/** A script the recorded runner never finishes. */
+const HOLD = "await new Promise(() => {});";
 
 /** A thread whose turn is running on a session no process holds. */
 const startTurn = Effect.fn("startTurn")(function* (
@@ -332,9 +335,15 @@ const withCodeMode = <A, E, R>(
     /** Runs scripts in real Node sessions instead of recording them. */
     readonly realRunner?: boolean;
     readonly revocations?: Queue.Queue<McpInvocationContext.McpThreadCaller>;
-    readonly settingChanges?: Queue.Queue<ServerSettingsValue>;
+    /** Credentials the registry no longer holds. */
+    readonly revoked?: ReadonlySet<string>;
+    /** Each recorded session's process starts once this succeeds. */
+    readonly starting?: Effect.Effect<void>;
+    readonly settingChanges?: Queue.Queue<ServerSettingsValue, Cause.Done>;
     /** Why each recorded session was ended. */
     readonly ended?: Array<string>;
+    /** Receives the same reasons, for a test to wait on. */
+    readonly endings?: Queue.Queue<string>;
     /** Set to make every recorded session's process report that it exited. */
     readonly exited?: { reason: string | undefined };
   } = {},
@@ -367,9 +376,20 @@ const withCodeMode = <A, E, R>(
               ? CodeRunner.layer.pipe(Layer.provide(NodeServices.layer))
               : Layer.mock(CodeRunner.CodeRunner)({
                   start: () =>
-                    Effect.succeed({
-                      evaluate: (input) => Effect.sync(() => (runs.push(input.code), ran)),
-                      end: (reason) => Effect.sync(() => options.ended?.push(reason)),
+                    Effect.as(options.starting ?? Effect.void, {
+                      evaluate: (input) =>
+                        input.code === HOLD
+                          ? Effect.never
+                          : Effect.sync(() => (runs.push(input.code), ran)),
+                      end: (reason) =>
+                        Effect.sync(() => options.ended?.push(reason)).pipe(
+                          Effect.andThen(
+                            options.endings === undefined
+                              ? Effect.void
+                              : Queue.offer(options.endings, reason),
+                          ),
+                          Effect.asVoid,
+                        ),
                       ended: Effect.suspend(() =>
                         options.exited?.reason === undefined
                           ? Effect.never
@@ -381,20 +401,23 @@ const withCodeMode = <A, E, R>(
             Layer.mock(McpSessionRegistry.McpSessionRegistry)({
               subscribeRevocations: Effect.succeed(
                 options.revocations === undefined
-                  ? Stream.empty
+                  ? Stream.never
                   : Stream.fromQueue(options.revocations),
               ),
+              isIssued: (providerSessionId) =>
+                Effect.succeed(options.revoked?.has(providerSessionId) !== true),
             }),
             Layer.effect(
               ServerSettings.ServerSettingsService,
-              Effect.map(ServerSettings.ServerSettingsService, (settings) =>
-                options.settingChanges === undefined
-                  ? settings
-                  : {
-                      ...settings,
-                      subscribeChanges: Effect.succeed(Stream.fromQueue(options.settingChanges)),
-                    },
-              ),
+              Effect.map(ServerSettings.ServerSettingsService, (settings) => ({
+                ...settings,
+                // The test layer's stream ends at once, which Code Mode reads as lost changes.
+                subscribeChanges: Effect.succeed(
+                  options.settingChanges === undefined
+                    ? Stream.never
+                    : Stream.fromQueue(options.settingChanges),
+                ),
+              })),
             ),
           ),
         ),
@@ -842,27 +865,44 @@ it.effect("starts a new session after a reset, a timeout or a cancelled call, an
 
         yield* runScript(codeMode, threadId, keep);
         const timedOut = yield* holding();
-        const long = yield* runScript(codeMode, threadId, "await t3.hold();", {
-          bindings: timedOut.bindings,
-        }).pipe(Effect.forkChild);
+        const long = yield* runScript(
+          codeMode,
+          threadId,
+          "console.log('before'); await t3.hold();",
+          {
+            bindings: timedOut.bindings,
+          },
+        ).pipe(Effect.forkChild);
         yield* timedOut.called;
         yield* TestClock.adjust(CodeMode.YIELD_AFTER);
         const handle = (yield* Fiber.join(long)).handle;
-        yield* TestClock.adjust(CodeRunner.RUN_TIMEOUT);
+        // Exactly to the timeout: any further and the pipes' grace would end first.
+        yield* TestClock.adjust(Duration.subtract(CodeRunner.RUN_TIMEOUT, CodeMode.YIELD_AFTER));
         yield* timedOut.stopped;
-        const unknown = yield* codeMode
-          .poll({ threadId, providerSessionId: credential, handle, wait: Duration.zero })
-          .pipe(Effect.flip);
-        assert.equal(
-          unknown.message,
-          `Evaluation ${handle} is gone: the session restarted, so its globalThis values are gone too. The script ran longer than 10 minutes and was stopped.`,
+        const timeout = "The script ran longer than 10 minutes and was stopped.";
+        const polled = yield* codeMode.poll({
+          threadId,
+          providerSessionId: credential,
+          handle,
+          wait: CodeMode.YIELD_AFTER,
+        });
+        assert.deepEqual(
+          [polled.status, polled.stdout, polled.error, polled.notice],
+          ["done", "before\n", timeout, timeout],
         );
         assert.deepEqual(sessionOf(yield* runScript(codeMode, threadId, kept)), {
           status: "done",
           result: "undefined",
           sessionStarted: true,
-          notice: "The script ran longer than 10 minutes and was stopped.",
+          notice: timeout,
         });
+        const gone = yield* codeMode
+          .poll({ threadId, providerSessionId: credential, handle, wait: Duration.zero })
+          .pipe(Effect.flip);
+        assert.equal(
+          gone.message,
+          `Evaluation ${handle} is gone: a later t3_code_run replaced it.`,
+        );
 
         yield* runScript(codeMode, threadId, keep);
         const dropped = yield* holding();
@@ -941,12 +981,107 @@ it.effect("starts a new session for a new or revoked credential", () =>
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect("refuses a script whose credential ends while it waits for approval or a session", () =>
+  Effect.gen(function* () {
+    const ended: Array<string> = [];
+    const revoked = new Set<string>();
+    const revocations = yield* Queue.unbounded<McpInvocationContext.McpThreadCaller>();
+    const startBegan = yield* Deferred.make<void>();
+    const startGate = yield* Deferred.make<void>();
+    let starting: Effect.Effect<void> = Effect.void;
+    const revoke = (threadId: ThreadId, providerSessionId: string) =>
+      Effect.sync(() => revoked.add(providerSessionId)).pipe(
+        Effect.andThen(
+          Queue.offer(revocations, { threadId, providerSessionId, providerInstanceId: instanceId }),
+        ),
+      );
+    yield* withCodeMode(
+      (codeMode, runs) =>
+        Effect.gen(function* () {
+          const asking = yield* startTurn("revoked-asking");
+          const waiting = yield* startAsking(codeMode, asking.threadId, "return 'asked'");
+          yield* revoke(asking.threadId, credential);
+          yield* respond(asking.threadId, waiting.requestId, "accept");
+          assert.equal(refusal(yield* Fiber.await(waiting.script)), "CodeModeCredentialEndedError");
+
+          const late = yield* startTurn("revoked-starting", "full-access");
+          starting = Deferred.succeed(startBegan, undefined).pipe(
+            Effect.andThen(Deferred.await(startGate)),
+          );
+          const script = yield* runScript(codeMode, late.threadId, "return 'started'", {
+            providerSessionId: "credential:starting",
+          }).pipe(Effect.exit, Effect.forkChild);
+          yield* Deferred.await(startBegan);
+          yield* revoke(late.threadId, "credential:starting");
+          yield* Deferred.succeed(startGate, undefined);
+          assert.equal(refusal(yield* Fiber.join(script)), "CodeModeCredentialEndedError");
+
+          assert.deepEqual(runs, []);
+          const revokedNotice = "The provider session that started the previous session ended.";
+          assert.ok(ended.length > 0 && ended.every((reason) => reason === revokedNotice));
+        }),
+      {
+        revocations,
+        revoked,
+        ended,
+        starting: Effect.suspend(() => starting),
+      },
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect(
-  "stops a running evaluation when its turn ends, the mode changes, the thread is archived or Code Mode is turned off",
+  "ends an idle session when the thread's mode changes, but not for an unchanged mode",
+  () =>
+    Effect.gen(function* () {
+      const endings = yield* Queue.unbounded<string>();
+      yield* withCodeMode(
+        (codeMode) =>
+          Effect.gen(function* () {
+            const threads = yield* ThreadManagementService.ThreadManagementService;
+            const unchanged = yield* startTurn("mode-unchanged", "full-access");
+            const changed = yield* startTurn("mode-changed-idle", "full-access");
+            yield* runScript(codeMode, unchanged.threadId, "return 1");
+            yield* runScript(codeMode, changed.threadId, "return 1");
+
+            yield* threads.dispatch({
+              type: "thread.interaction-mode.set",
+              commandId: CommandId.make("mode:unchanged"),
+              threadId: unchanged.threadId,
+              interactionMode: "default",
+            });
+            yield* threads.dispatch({
+              type: "thread.runtime-mode.set",
+              commandId: CommandId.make("mode:changed-idle"),
+              threadId: changed.threadId,
+              runtimeMode: "auto",
+            });
+            const modeChanged = "The thread's mode changed, so its session ended.";
+            // Events arrive in order, so the unchanged thread's event has been handled too.
+            assert.equal(yield* Queue.take(endings), modeChanged);
+
+            assert.equal(
+              (yield* runScript(codeMode, unchanged.threadId, "return 1")).sessionStarted,
+              undefined,
+            );
+            assert.deepEqual(sessionOf(yield* runScript(codeMode, changed.threadId, "return 1")), {
+              status: "done",
+              result: null,
+              sessionStarted: true,
+              notice: modeChanged,
+            });
+          }),
+        { endings },
+      );
+    }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect(
+  "stops a running evaluation when its turn ends, the mode changes, the thread is archived, Code Mode is turned off, or T3 stops hearing about those changes",
   () =>
     Effect.gen(function* () {
       const events = yield* Queue.unbounded<OrchestrationV2DomainEvent>();
-      const settingChanges = yield* Queue.unbounded<ServerSettingsValue>();
+      const settingChanges = yield* Queue.unbounded<ServerSettingsValue, Cause.Done>();
       const withEvents = (threads: Threads): Threads => ({
         ...threads,
         streamDomainEvents: Stream.merge(threads.streamDomainEvents, Stream.fromQueue(events)),
@@ -1063,6 +1198,16 @@ it.effect(
               sessionStarted: true,
               notice: "Code Mode was turned off, so every session ended.",
             });
+
+            // Last: the setting watcher then keeps finding its stream ended.
+            const lost = yield* startTurn("watch-lost", "full-access", instanceId, cwd);
+            const lostWatch = yield* stoppedBy(lost.threadId, Queue.end(settingChanges));
+            assert.deepEqual(sessionOf(lostWatch.next), {
+              status: "done",
+              result: "undefined",
+              sessionStarted: true,
+              notice: "T3 lost track of the changes that end sessions, so every session ended.",
+            });
           }),
         { realRunner: true, threads: withEvents, settingChanges },
       );
@@ -1139,37 +1284,72 @@ it.effect("ends a session after 10 idle minutes", () =>
   ).pipe(Effect.provide(layerTest)),
 );
 
-it.effect("stops the least recently used session to start one past the limit", () => {
-  const ended: Array<string> = [];
-  return withCodeMode(
-    (codeMode) =>
-      Effect.gen(function* () {
-        const threadIds: Array<ThreadId> = [];
-        for (let index = 0; index <= CodeMode.SESSION_LIMIT; index++) {
-          threadIds.push((yield* startTurn(`lru-${index}`, "full-access")).threadId);
-        }
-        const [first, second] = threadIds;
-        for (const threadId of threadIds.slice(0, CodeMode.SESSION_LIMIT)) {
-          yield* runScript(codeMode, threadId, "return 1");
-        }
-        yield* runScript(codeMode, first!, "return 1");
-        assert.deepEqual(ended, []);
+it.effect("stops the least recently used idle session to start one past the limit", () =>
+  Effect.gen(function* () {
+    const ended: Array<string> = [];
+    const began = yield* Queue.unbounded<void>();
+    let starting: Effect.Effect<void> = Effect.void;
+    yield* withCodeMode(
+      (codeMode) =>
+        Effect.gen(function* () {
+          const threadIds: Array<ThreadId> = [];
+          for (let index = 0; index < CodeMode.SESSION_LIMIT + 2; index++) {
+            threadIds.push((yield* startTurn(`lru-${index}`, "full-access")).threadId);
+          }
+          const at = (index: number) => threadIds[index]!;
+          for (const threadId of threadIds.slice(0, CodeMode.SESSION_LIMIT)) {
+            yield* runScript(codeMode, threadId, "return 1");
+          }
+          yield* runScript(codeMode, at(0), "return 1");
+          assert.deepEqual(ended, []);
 
-        yield* runScript(codeMode, threadIds[CodeMode.SESSION_LIMIT]!, "return 1");
-        const evicted =
-          "The previous session was stopped to make room: at most 16 sessions run at once.";
-        assert.deepEqual(ended, [evicted]);
-        assert.equal((yield* runScript(codeMode, first!, "return 1")).sessionStarted, undefined);
-        assert.deepEqual(sessionOf(yield* runScript(codeMode, second!, "return 1")), {
-          status: "done",
-          result: null,
-          sessionStarted: true,
-          notice: evicted,
-        });
-      }),
-    { ended },
-  ).pipe(Effect.provide(layerTest));
-});
+          // Two first calls past the limit at once: each takes its own place.
+          const release = yield* Deferred.make<void>();
+          starting = Queue.offer(began, undefined).pipe(Effect.andThen(Deferred.await(release)));
+          const concurrent = yield* Effect.forEach(
+            [at(CodeMode.SESSION_LIMIT), at(CodeMode.SESSION_LIMIT + 1)],
+            (threadId) => runScript(codeMode, threadId, "return 1").pipe(Effect.forkChild),
+          );
+          yield* Queue.take(began);
+          yield* Queue.take(began);
+          starting = Effect.void;
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.joinAll(concurrent);
+          const evicted =
+            "The previous session was stopped to make room: at most 16 sessions run at once.";
+          assert.deepEqual(ended, [evicted, evicted]);
+          assert.equal((yield* runScript(codeMode, at(0), "return 1")).sessionStarted, undefined);
+
+          // Every session runs but the most recently used, so that one makes room.
+          const running = yield* Effect.forEach(
+            [...threadIds.slice(3, CodeMode.SESSION_LIMIT + 1), at(0)],
+            (threadId) => runScript(codeMode, threadId, HOLD).pipe(Effect.forkChild),
+          );
+          yield* TestClock.adjust(CodeMode.YIELD_AFTER);
+          yield* Fiber.joinAll(running);
+          yield* runScript(codeMode, at(CodeMode.SESSION_LIMIT + 1), "return 1");
+          const replacing = yield* runScript(codeMode, at(1), HOLD).pipe(Effect.forkChild);
+          yield* TestClock.adjust(CodeMode.YIELD_AFTER);
+          assert.deepEqual(sessionOf(yield* Fiber.join(replacing)), {
+            status: "running",
+            result: undefined,
+            sessionStarted: true,
+            notice: evicted,
+          });
+          assert.deepEqual(ended, [evicted, evicted, evicted]);
+          const lru = yield* runScript(codeMode, at(3), "return 1").pipe(Effect.flip);
+          assert.equal(lru._tag, "CodeModeBusyError");
+
+          const full = yield* runScript(codeMode, at(2), "return 1").pipe(Effect.flip);
+          assert.equal(
+            full.message,
+            "All 16 JavaScript sessions on this machine are running scripts, so a new one cannot start. Try again once one finishes.",
+          );
+        }),
+      { ended, starting: Effect.suspend(() => starting) },
+    );
+  }).pipe(Effect.provide(layerTest)),
+);
 
 it.effect("starts a new session when the previous one's process exited on its own", () => {
   const exited: { reason: string | undefined } = { reason: undefined };

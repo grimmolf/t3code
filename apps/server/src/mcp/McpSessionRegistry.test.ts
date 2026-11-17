@@ -60,14 +60,17 @@ it.effect(
       );
 
       const revocations = yield* registry.subscribeRevocations;
+      expect(yield* registry.isIssued(issued.config.providerSessionId)).toBe(true);
       yield* registry.revokeThread(threadId);
       expect(yield* registry.resolve(token)).toBeUndefined();
+      expect(yield* registry.isIssued(issued.config.providerSessionId)).toBe(false);
       const other = yield* registry.issue({
         threadId: ThreadId.make("thread-2"),
         providerInstanceId: ProviderInstanceId.make("codex"),
         capabilities: new Set(),
       });
       yield* registry.revokeProviderSession(other.config.providerSessionId);
+      expect(yield* registry.isIssued(other.config.providerSessionId)).toBe(false);
       expect(Array.from(yield* Stream.runCollect(Stream.take(revocations, 2)))).toEqual([
         resolved?.thread,
         expect.objectContaining({ providerSessionId: other.config.providerSessionId }),

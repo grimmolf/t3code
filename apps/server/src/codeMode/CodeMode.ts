@@ -3,13 +3,16 @@ import {
   type OrchestrationV2DomainEvent,
   type OrchestrationV2RunStatus,
   type ProviderApprovalOption,
+  type ProviderInteractionMode,
   type RunId,
+  type RuntimeMode,
   type RuntimeRequestId,
   ThreadId,
 } from "@t3tools/contracts";
 import { randomUuidV4 } from "@t3tools/provider-core/server/randomUuid";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
+import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Clock from "effect/Clock";
 import * as Deferred from "effect/Deferred";
@@ -59,6 +62,24 @@ export class CodeModeTurnEndedError extends Schema.TaggedError<CodeModeTurnEnded
 ) {
   override get message(): string {
     return `The turn that called t3_code_run in thread ${this.threadId} is no longer running, so the script did not run.`;
+  }
+}
+
+export class CodeModeCredentialEndedError extends Schema.TaggedError<CodeModeCredentialEndedError>()(
+  "CodeModeCredentialEndedError",
+  { threadId: ThreadId },
+) {
+  override get message(): string {
+    return `The provider session that called t3_code_run in thread ${this.threadId} has ended, so the script did not run.`;
+  }
+}
+
+export class CodeModeSessionEndedError extends Schema.TaggedError<CodeModeSessionEndedError>()(
+  "CodeModeSessionEndedError",
+  { reason: Schema.String },
+) {
+  override get message(): string {
+    return `The thread's JavaScript session ended before the script started, so it did not run: ${this.reason}`;
   }
 }
 
@@ -138,8 +159,18 @@ export type CodeRunResult = typeof CodeRunResult.Type;
 export const YIELD_AFTER = Duration.seconds(20);
 export const IDLE_TIMEOUT = Duration.minutes(10);
 export const SESSION_LIMIT = 16;
-// Reasons kept for threads whose session ended, so their next call can say why.
+// Kept for threads whose session ended, so their next call can say why and a poll can still
+// read the last evaluation's output.
 const NOTICE_LIMIT = 4 * SESSION_LIMIT;
+
+export class CodeModeFullError extends Schema.TaggedError<CodeModeFullError>()(
+  "CodeModeFullError",
+  {},
+) {
+  override get message(): string {
+    return `All ${SESSION_LIMIT} JavaScript sessions on this machine are running scripts, so a new one cannot start. Try again once one finishes.`;
+  }
+}
 
 const ENDED_RUN_STATUSES: ReadonlySet<OrchestrationV2RunStatus> = new Set([
   "completed",
@@ -159,13 +190,15 @@ const ENDED = {
   archived: "The thread was archived, so its session ended.",
   deleted: "The thread was deleted, so its session ended.",
   off: "Code Mode was turned off, so every session ended.",
-  unwatched: "T3 lost track of thread changes, so every session ended.",
+  unwatched: "T3 lost track of the changes that end sessions, so every session ended.",
   cancelled: (handle: string) =>
     `The t3_code_run call that started ${handle} was cancelled, so its session was stopped.`,
   turnEnded: (handle: string) =>
     `The turn that started ${handle} ended, so its session was stopped.`,
-  modeChanged: (handle: string) =>
-    `The thread's mode changed while ${handle} ran, so its session was stopped.`,
+  modeChanged: (handle: string | undefined) =>
+    handle === undefined
+      ? "The thread's mode changed, so its session ended."
+      : `The thread's mode changed while ${handle} ran, so its session was stopped.`,
 };
 
 export interface CodeModeCaller {
@@ -202,6 +235,9 @@ export class CodeMode extends Context.Service<
       | CodeModeOffError
       | CodeModeRefusedError
       | CodeModeTurnEndedError
+      | CodeModeCredentialEndedError
+      | CodeModeSessionEndedError
+      | CodeModeFullError
       | CodeModeNoWorkspaceError
       | CodeModeAskError
       | CodeModeNotApprovedError
@@ -226,17 +262,34 @@ interface Evaluation {
   readonly done: Deferred.Deferred<CodeRunner.CodeRunOutput>;
 }
 
+interface ThreadModes {
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: ProviderInteractionMode;
+}
+
 interface Session {
   readonly threadId: ThreadId;
   readonly providerSessionId: string;
   readonly cwd: string;
-  readonly code: CodeRunner.CodeSession;
   readonly scope: Scope.Closeable;
+  /** Unset while its process starts. */
+  code: CodeRunner.CodeSession | undefined;
+  /** The thread's modes when its latest evaluation began. */
+  modes: ThreadModes | undefined;
   /** Set until its first evaluation starts, with why the thread's previous session ended. */
   fresh: { readonly notice: string | undefined } | undefined;
   /** The latest evaluation, running or done. */
   evaluation: Evaluation | undefined;
   idle: Fiber.Fiber<void> | undefined;
+  /** Why it ended, once it has. */
+  endedBy: string | undefined;
+}
+
+/** Why a thread's last session ended, and its last evaluation. */
+interface Ending {
+  readonly reason: string;
+  readonly providerSessionId: string;
+  readonly evaluation: Evaluation | undefined;
 }
 
 const isRunning = (evaluation: Evaluation | undefined): evaluation is Evaluation =>
@@ -256,9 +309,9 @@ const make = Effect.gen(function* () {
   const layerScope = yield* Scope.Scope;
   // A session outlives the call that starts it, so it runs on the layer's services, not the request's.
   const layerContext = yield* Effect.context<never>();
-  /** One per thread, least recently used first. */
+  /** One per thread, least recently used first, including those whose process is starting. */
   const sessions = new Map<ThreadId, Session>();
-  const notices = new Map<ThreadId, string>();
+  const endings = new Map<ThreadId, Ending>();
   const sessionLocks = yield* KeyedLock.make<ThreadId>();
 
   // Read per call, so turning the setting off refuses the next call.
@@ -375,19 +428,25 @@ const make = Effect.gen(function* () {
   const forget = (session: Session, reason: string) => {
     if (sessions.get(session.threadId) !== session) return;
     sessions.delete(session.threadId);
-    notices.delete(session.threadId);
-    notices.set(session.threadId, reason);
-    const oldest = notices.keys().next();
-    if (notices.size > NOTICE_LIMIT && !oldest.done) notices.delete(oldest.value);
+    session.endedBy = reason;
+    endings.delete(session.threadId);
+    endings.set(session.threadId, {
+      reason,
+      providerSessionId: session.providerSessionId,
+      evaluation: session.evaluation,
+    });
+    const oldest = endings.keys().next();
+    if (endings.size > NOTICE_LIMIT && !oldest.done) endings.delete(oldest.value);
   };
 
-  // Every way a session ends comes here; `open` closes its scope once the process has exited.
-  // Uninterruptible: a forgotten session whose kill was cut short would keep its process.
+  // Every way a session ends comes here; `open` closes its scope once the process has exited,
+  // and kills a process that was still starting. Uninterruptible: a forgotten session whose kill
+  // was cut short would keep its process.
   const end = (session: Session, reason: string) =>
     Effect.uninterruptible(
       Effect.suspend(() => {
         forget(session, reason);
-        return session.code.end(reason);
+        return session.code?.end(reason) ?? Effect.void;
       }),
     );
 
@@ -415,28 +474,52 @@ const make = Effect.gen(function* () {
           ),
     );
 
+  /**
+   * Takes the thread's place before its process starts, so starts in flight count against the
+   * limit. When every place is taken, the least recently used idle session gives up its own.
+   */
+  const claim = (session: Session) =>
+    Effect.suspend(() => {
+      let evicted: Session | undefined;
+      if (sessions.size >= SESSION_LIMIT) {
+        evicted = Array.from(sessions.values()).find(
+          (other) => other.code !== undefined && !isRunning(other.evaluation),
+        );
+        if (evicted === undefined) return Effect.fail(new CodeModeFullError());
+        forget(evicted, ENDED.evicted);
+      }
+      sessions.set(session.threadId, session);
+      return evicted === undefined ? Effect.void : end(evicted, ENDED.evicted);
+    });
+
   const open = Effect.fn("CodeMode.open")(function* (caller: CodeModeCaller, cwd: string) {
-    const oldest = sessions.values().next();
-    if (sessions.size >= SESSION_LIMIT && !oldest.done) yield* end(oldest.value, ENDED.evicted);
     const scope = yield* Scope.fork(layerScope);
-    const code = yield* runner.start({ cwd, environment }).pipe(
-      Scope.provide(scope),
-      Effect.provideContext(layerContext),
-      Effect.onError(() => Scope.close(scope, Exit.void)),
-    );
     const session: Session = {
       threadId: caller.threadId,
       providerSessionId: caller.providerSessionId,
       cwd,
-      code,
       scope,
-      fresh: { notice: notices.get(caller.threadId) },
+      code: undefined,
+      modes: undefined,
+      fresh: { notice: endings.get(caller.threadId)?.reason },
       evaluation: undefined,
       idle: undefined,
+      endedBy: undefined,
     };
-    notices.delete(caller.threadId);
-    sessions.set(caller.threadId, session);
-    // The scope also holds the evaluation's t3 calls, so it closes only once the evaluation has settled.
+    yield* claim(session).pipe(Effect.onError(() => Scope.close(scope, Exit.void)));
+    const code = yield* runner.start({ cwd, environment }).pipe(
+      Scope.provide(scope),
+      Effect.provideContext(layerContext),
+      Effect.onError(() =>
+        Effect.sync(() => {
+          if (sessions.get(caller.threadId) === session) sessions.delete(caller.threadId);
+        }).pipe(Effect.andThen(Scope.close(scope, Exit.void))),
+      ),
+    );
+    session.code = code;
+    if (session.endedBy !== undefined) yield* code.end(session.endedBy);
+    else endings.delete(caller.threadId);
+    // The evaluation runs in the scope, so it closes only once the evaluation has settled.
     yield* code.ended.pipe(
       Effect.flatMap((reason) => {
         forget(session, reason);
@@ -448,7 +531,7 @@ const make = Effect.gen(function* () {
       Effect.andThen(Scope.close(scope, Exit.void)),
       Effect.forkIn(layerScope),
     );
-    return session;
+    return { session, code };
   });
 
   const runIsLive = (threadId: ThreadId, runId: RunId) =>
@@ -484,9 +567,11 @@ const make = Effect.gen(function* () {
         const idle = sessions.get(input.threadId)?.idle;
         if (idle !== undefined) yield* Fiber.interrupt(idle);
         let session = sessions.get(input.threadId);
+        // Under this lock the thread's own session has finished starting.
+        let code = session?.code;
         // Its process may have exited before `open` heard of it.
-        if (session !== undefined && (yield* session.code.hasEnded)) {
-          forget(session, yield* session.code.ended);
+        if (session !== undefined && code !== undefined && (yield* code.hasEnded)) {
+          forget(session, yield* code.ended);
           session = undefined;
         } else if (session !== undefined && session.providerSessionId !== input.providerSessionId) {
           yield* end(session, ENDED.credential);
@@ -497,18 +582,19 @@ const make = Effect.gen(function* () {
         }
         const previous = session?.evaluation;
         if (isRunning(previous)) return yield* new CodeModeBusyError({ handle: previous.handle });
-        const target = session ?? (yield* open(input, cwd));
-        target.idle = undefined;
+        if (session === undefined || code === undefined)
+          ({ session, code } = yield* open(input, cwd));
+        session.idle = undefined;
         const evaluation: Evaluation = {
           handle: yield* randomUuidV4,
           runId,
-          sessionStarted: target.fresh !== undefined,
-          notice: target.fresh?.notice,
+          sessionStarted: session.fresh !== undefined,
+          notice: session.fresh?.notice,
           done: yield* Deferred.make<CodeRunner.CodeRunOutput>(),
         };
-        target.evaluation = evaluation;
-        touch(target);
-        return { session: target, evaluation };
+        session.evaluation = evaluation;
+        touch(session);
+        return { session, code, evaluation };
       }),
     );
   });
@@ -517,17 +603,23 @@ const make = Effect.gen(function* () {
     Effect.suspend(() => {
       if (session.evaluation !== evaluation) return Effect.void;
       session.evaluation = undefined;
-      return armIdle(session);
+      // Nobody holds its handle, but `open` waits for it to settle before closing the scope.
+      return Deferred.interrupt(evaluation.done).pipe(Effect.andThen(armIdle(session)));
     });
 
   const begin = (
     session: Session,
+    code: CodeRunner.CodeSession,
     evaluation: Evaluation,
     input: { readonly code: string; readonly bindings: CodeModeBindings },
   ) =>
     Effect.suspend(() => {
+      // Checked as it forks into the session's scope, which closes once the session has ended.
+      if (session.endedBy !== undefined) {
+        return Effect.fail(new CodeModeSessionEndedError({ reason: session.endedBy }));
+      }
       session.fresh = undefined;
-      return session.code
+      return code
         .evaluate({
           code: input.code,
           tools: input.bindings.tools,
@@ -565,11 +657,19 @@ const make = Effect.gen(function* () {
     }
     // One deadline for the whole call: queueing behind other cards and waiting for this one.
     const deadline = (yield* Clock.currentTimeMillis) + Duration.toMillis(ASK_TIMEOUT);
-    // The setting, the thread's mode and the turn can all change while a call waits.
+    // The setting, the thread's mode, the turn and the credential can all change while a call waits.
     const current = permit(threadId).pipe(
       Effect.filterOrFail(
         (permitted) => permitted.runId === runId,
         () => new CodeModeTurnEndedError({ threadId }),
+      ),
+      Effect.tap(() =>
+        registry.isIssued(input.providerSessionId).pipe(
+          Effect.filterOrFail(
+            (issued) => issued,
+            () => new CodeModeCredentialEndedError({ threadId }),
+          ),
+        ),
       ),
     );
     let approved = false;
@@ -586,14 +686,23 @@ const make = Effect.gen(function* () {
         if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
         const started = yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
-            const { session, evaluation } = yield* reserve(input, runId, cwd);
+            const { session, code, evaluation } = yield* reserve(input, runId, cwd);
             // Registered first, so a change after this check ends the session instead.
-            const recheck = yield* current.pipe(Effect.onError(() => cancel(session, evaluation)));
+            const recheck = yield* current.pipe(
+              Effect.onError(() => cancel(session, evaluation)),
+              Effect.tapErrorTag("CodeModeCredentialEndedError", () => end(session, ENDED.revoked)),
+            );
             if (recheck.decision !== "run" && !approved) {
               yield* cancel(session, evaluation);
               return Option.none<CodeRunResult>();
             }
-            yield* begin(session, evaluation, input);
+            session.modes = {
+              runtimeMode: recheck.shell.runtimeMode,
+              interactionMode: recheck.shell.interactionMode,
+            };
+            yield* begin(session, code, evaluation, input).pipe(
+              Effect.onError(() => cancel(session, evaluation)),
+            );
             return Option.some(
               yield* restore(settle(evaluation, YIELD_AFTER)).pipe(
                 Effect.onInterrupt(() => end(session, ENDED.cancelled(evaluation.handle))),
@@ -622,22 +731,38 @@ const make = Effect.gen(function* () {
     }
   });
 
-  /** The thread's session, ended first when another credential started it. */
-  const sessionOf = (caller: CodeModeCaller) =>
-    Effect.suspend(() => {
-      const session = sessions.get(caller.threadId);
-      return session === undefined || session.providerSessionId === caller.providerSessionId
-        ? Effect.succeed(session)
-        : end(session, ENDED.credential).pipe(Effect.as(undefined));
-    });
+  /** The thread's session, dropped first when another credential started it or its process exited. */
+  const sessionOf = Effect.fn("CodeMode.sessionOf")(function* (caller: CodeModeCaller) {
+    const session = sessions.get(caller.threadId);
+    if (session === undefined) return undefined;
+    if (session.providerSessionId !== caller.providerSessionId) {
+      yield* end(session, ENDED.credential);
+      return undefined;
+    }
+    if (session.code !== undefined && (yield* session.code.hasEnded)) {
+      forget(session, yield* session.code.ended);
+      return undefined;
+    }
+    return session;
+  });
 
   const poll = Effect.fn("CodeMode.poll")(function* (
     input: CodeModeCaller & { readonly handle: string; readonly wait: Duration.Duration },
   ) {
     const session = yield* sessionOf(input);
     const evaluation = session?.evaluation;
+    const ending = endings.get(input.threadId);
+    if (
+      session === undefined &&
+      ending?.evaluation?.handle === input.handle &&
+      ending.providerSessionId === input.providerSessionId
+    ) {
+      // Its session ended, but what it wrote until then is still worth reading.
+      const output = yield* settle(ending.evaluation, Duration.min(input.wait, YIELD_AFTER));
+      return { ...output, notice: ending.reason };
+    }
     if (session === undefined || evaluation?.handle !== input.handle) {
-      const notice = notices.get(input.threadId);
+      const notice = ending?.reason;
       return yield* new CodeModeUnknownHandleError({
         handle: input.handle,
         reason:
@@ -670,9 +795,11 @@ const make = Effect.gen(function* () {
             : Effect.void;
         case "thread.runtime-mode-updated":
         case "thread.interaction-mode-updated":
-          return running === undefined
+          // Even an idle session ends: timers a script left behind would act under the old mode.
+          return session.modes?.runtimeMode === event.payload.runtimeMode &&
+            session.modes.interactionMode === event.payload.interactionMode
             ? Effect.void
-            : end(session, ENDED.modeChanged(running.handle));
+            : end(session, ENDED.modeChanged(running?.handle));
         case "thread.archived":
           return end(session, ENDED.archived);
         case "thread.deleted":
@@ -682,28 +809,48 @@ const make = Effect.gen(function* () {
       }
     });
 
-  yield* Stream.runForEach(threads.streamDomainEvents, onEvent).pipe(
-    Effect.tapError((error) =>
-      Effect.logWarning("Code Mode lost the thread event stream", { error: error.message }).pipe(
-        Effect.andThen(endAll(ENDED.unwatched)),
+  /**
+   * Keeps a watcher subscribed. A watcher that stopped may have missed an event that ends a
+   * session, so every session ends before it subscribes again.
+   */
+  const keepWatching = <E>(what: string, watcher: Effect.Effect<void, E, Scope.Scope>) =>
+    Effect.scoped(watcher).pipe(
+      Effect.andThen(Effect.fail(`${what} ended`)),
+      Effect.sandbox,
+      Effect.tapError((cause) =>
+        Effect.logWarning(`Code Mode lost ${what}`, { cause: Cause.pretty(cause) }).pipe(
+          Effect.andThen(endAll(ENDED.unwatched)),
+        ),
+      ),
+      Effect.retry(Schedule.spaced(Duration.seconds(1))),
+      Effect.forkScoped({ startImmediately: true }),
+    );
+
+  yield* keepWatching(
+    "the thread event stream",
+    Stream.runForEach(threads.streamDomainEvents, onEvent),
+  );
+  yield* keepWatching(
+    "credential revocations",
+    Effect.flatMap(registry.subscribeRevocations, (revocations) =>
+      Stream.runForEach(revocations, (caller) =>
+        Effect.suspend(() => {
+          const session = sessions.get(caller.threadId);
+          return session !== undefined && session.providerSessionId === caller.providerSessionId
+            ? end(session, ENDED.revoked)
+            : Effect.void;
+        }),
       ),
     ),
-    Effect.retry(Schedule.spaced(Duration.seconds(1))),
-    Effect.forkScoped,
   );
-  const revocations = yield* registry.subscribeRevocations;
-  yield* Stream.runForEach(revocations, (caller) =>
-    Effect.suspend(() => {
-      const session = sessions.get(caller.threadId);
-      return session !== undefined && session.providerSessionId === caller.providerSessionId
-        ? end(session, ENDED.revoked)
-        : Effect.void;
-    }),
-  ).pipe(Effect.forkScoped);
-  const settingChanges = yield* settings.subscribeChanges;
-  yield* Stream.runForEach(settingChanges, (next) =>
-    next.codeModeEnabled ? Effect.void : endAll(ENDED.off),
-  ).pipe(Effect.forkScoped);
+  yield* keepWatching(
+    "setting changes",
+    Effect.flatMap(settings.subscribeChanges, (changes) =>
+      Stream.runForEach(changes, (next) =>
+        next.codeModeEnabled ? Effect.void : endAll(ENDED.off),
+      ),
+    ),
+  );
 
   return CodeMode.of({ offered, run, poll, reset });
 });

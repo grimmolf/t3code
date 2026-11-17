@@ -25,6 +25,7 @@ export const layer = Layer.succeed(
     revokeProviderSession: () => Effect.void,
     revokeThread: () => Effect.void,
     revokeAll: Effect.void,
+    isIssued: () => Effect.succeed(true),
     subscribeRevocations: Effect.succeed(Stream.empty),
   }),
 );

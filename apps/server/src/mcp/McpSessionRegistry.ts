@@ -38,6 +38,8 @@ export interface McpSessionRegistryShape {
   readonly revokeProviderSession: (providerSessionId: string) => Effect.Effect<void>;
   readonly revokeThread: (threadId: ThreadId) => Effect.Effect<void>;
   readonly revokeAll: Effect.Effect<void>;
+  /** Whether the credential with this `providerSessionId` is still issued, not revoked. */
+  readonly isIssued: (providerSessionId: string) => Effect.Effect<boolean>;
   /** Each credential `revokeThread` or `revokeProviderSession` revokes, from subscription on. */
   readonly subscribeRevocations: Effect.Effect<
     Stream.Stream<McpInvocationContext.McpThreadCaller>,
@@ -238,6 +240,12 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       yield* revokeWhere((record) => record.scope.thread.threadId === threadId);
     }),
     revokeAll: SynchronizedRef.set(state, { records: new Map() }),
+    isIssued: Effect.fn("McpSessionRegistry.isIssued")(function* (providerSessionId) {
+      const { records } = yield* SynchronizedRef.get(state);
+      return Array.from(records.values()).some(
+        (record) => record.scope.thread.providerSessionId === providerSessionId,
+      );
+    }),
     subscribeRevocations: PubSub.subscribe(revoked).pipe(Effect.map(Stream.fromSubscription)),
   });
 });

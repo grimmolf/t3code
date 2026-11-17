@@ -500,34 +500,60 @@ it.layer(layerTest)("CodeRunner", (it) => {
         }),
     );
 
-    it.effect("stops the t3 calls an evaluation did not await once it returns", () =>
-      Effect.gen(function* () {
-        const started = yield* session();
-        const held = yield* Deferred.make<void>();
-        const stopped = yield* Deferred.make<void>();
-        const call: CodeRunner.EvaluateInput["call"] = (tool) =>
-          tool === "hold"
-            ? Deferred.succeed(held, undefined).pipe(
-                Effect.andThen(Effect.never),
-                Effect.onInterrupt(() => Deferred.succeed(stopped, undefined)),
-              )
-            : Deferred.await(held).pipe(Effect.as(null));
-        yield* started.evaluate({
-          tools: ["hold", "ready"],
-          code: "globalThis.holding = t3.hold(); await t3.ready();",
-          call,
-        });
+    it.effect(
+      "stops the t3 calls an evaluation did not await once it returns, or ends the session if one will not stop",
+      () =>
+        Effect.gen(function* () {
+          const started = yield* session();
+          const held = yield* Deferred.make<void>();
+          const stopped = yield* Deferred.make<void>();
+          const call: CodeRunner.EvaluateInput["call"] = (tool) =>
+            tool === "hold"
+              ? Deferred.succeed(held, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                  Effect.onInterrupt(() => Deferred.succeed(stopped, undefined)),
+                )
+              : Deferred.await(held).pipe(Effect.as(null));
+          yield* started.evaluate({
+            tools: ["hold", "ready"],
+            code: "globalThis.holding = t3.hold(); await t3.ready();",
+            call,
+          });
 
-        expect(yield* Deferred.isDone(stopped)).toBe(true);
-        const later = yield* started.evaluate({
-          tools: [],
-          code: "return await holding.catch((error) => error.message);",
-          call,
-        });
-        expect(later.result).toBe(
-          "t3.hold was stopped: the evaluation that called it has finished.",
-        );
-      }),
+          expect(yield* Deferred.isDone(stopped)).toBe(true);
+          const later = yield* started.evaluate({
+            tools: [],
+            code: "return await holding.catch((error) => error.message);",
+            call,
+          });
+          expect(later.result).toBe(
+            "t3.hold was stopped: the evaluation that called it has finished.",
+          );
+
+          const interrupted = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+          const stuck = yield* started
+            .evaluate({
+              tools: ["stuck"],
+              code: "t3.stuck(); return 'returned';",
+              call: () =>
+                Effect.never.pipe(
+                  Effect.onInterrupt(() =>
+                    Deferred.succeed(interrupted, undefined).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                    ),
+                  ),
+                ),
+            })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(interrupted);
+          yield* TestClock.adjust(CodeRunner.CALL_STOP_GRACE);
+          expect((yield* Fiber.join(stuck)).result).toBe("returned");
+          expect(yield* started.ended).toBe(
+            "A t3 call did not stop when its evaluation finished, so the session was stopped.",
+          );
+        }),
     );
 
     it.effect("refuses a call from a callback of an evaluation that has finished", () =>

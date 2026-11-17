@@ -87,6 +87,10 @@ export const RUN_TIMEOUT = Duration.minutes(10);
 export const PIPE_GRACE = Duration.seconds(2);
 const PIPES_HELD =
   "Output was cut off because a background process the script started kept its output open.";
+/** How long the t3 calls an evaluation left running get to stop once it returns. */
+export const CALL_STOP_GRACE = Duration.seconds(2);
+const CALLS_HELD =
+  "A t3 call did not stop when its evaluation finished, so the session was stopped.";
 export const RESPONSE_LIMIT_BYTES = 64 * 1024;
 /** Room left in the response for what Code Mode adds around an evaluation's output. */
 const ENVELOPE_BYTES = 1024;
@@ -644,12 +648,18 @@ const make = Effect.gen(function* () {
       current = running;
       stdout.install(running.stdout);
       stderr.install(running.stderr);
-      // A t3 call the script did not await stops here, before anyone reads the output.
+      // A t3 call the script did not await stops here, before anyone reads the output. The close
+      // runs apart, so a call that ignores its interruption ends the session instead of holding this.
       return yield* outcomeOf(running, evaluation).pipe(
         Effect.ensuring(
           Effect.suspend(() => {
             current = undefined;
-            return Scope.close(running.callScope, Exit.void);
+            return Effect.forkDetach(Scope.close(running.callScope, Exit.void)).pipe(
+              Effect.flatMap((closing) =>
+                Fiber.await(closing).pipe(Effect.timeoutOption(CALL_STOP_GRACE)),
+              ),
+              Effect.flatMap((closed) => (Option.isNone(closed) ? end(CALLS_HELD) : Effect.void)),
+            );
           }),
         ),
       );

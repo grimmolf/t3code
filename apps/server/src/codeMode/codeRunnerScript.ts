@@ -122,7 +122,7 @@ const writeErr = process.stderr.write.bind(process.stderr);
 const mark = (write, marker) => new Promise((resolve) => write(marker, () => resolve()));
 const describe = (error) => {
   try {
-    return error instanceof Error ? (error.stack ?? error.message) : String(error);
+    return error instanceof Error ? String(error.stack ?? error.message) : String(error);
   } catch {
     return "A thrown value that cannot be shown as text.";
   }

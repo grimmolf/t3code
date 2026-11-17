@@ -389,6 +389,10 @@ it.layer(layerTest)("CodeRunner", (it) => {
         expect((yield* evaluate("throw Object.create(null);")).error).toBe(
           "A thrown value that cannot be shown as text.",
         );
+        expect(
+          (yield* evaluate("const error = new Error('x'); error.stack = { a: 1 }; throw error;"))
+            .error,
+        ).toBe("[object Object]");
         expect((yield* evaluate("return typeof kept;")).result).toBe("number");
       }),
     );

@@ -120,7 +120,13 @@ const edit = (file, oldText, newText) => {
 const writeOut = process.stdout.write.bind(process.stdout);
 const writeErr = process.stderr.write.bind(process.stderr);
 const mark = (write, marker) => new Promise((resolve) => write(marker, () => resolve()));
-const describe = (error) => (error instanceof Error ? (error.stack ?? error.message) : String(error));
+const describe = (error) => {
+  try {
+    return error instanceof Error ? (error.stack ?? error.message) : String(error);
+  } catch {
+    return "A thrown value that cannot be shown as text.";
+  }
+};
 
 // As in Node's REPL, an error no caller of a script's callback can catch goes to stderr and the
 // session keeps running.

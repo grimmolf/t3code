@@ -350,9 +350,12 @@ it.layer(layerTest)("CodeRunner", (it) => {
           });
           expect(yield* started.ended).toBe("The session's process exited with code 7.");
 
-          // The runner cannot describe what was thrown, or its channel to T3 is gone.
+          // The runner cannot send its result, or its channel to T3 is gone.
           for (const [code, failure] of [
-            ["throw Object.create(null);", "TypeError: Cannot convert object to primitive value"],
+            [
+              "JSON.stringify = () => { throw new Error('sabotaged'); }; return 1;",
+              "Error: sabotaged",
+            ],
             ["require('node:fs').closeSync(3); return 1;", "Error: EBADF"],
           ] as const) {
             const broken = yield* session();
@@ -364,7 +367,7 @@ it.layer(layerTest)("CodeRunner", (it) => {
         }),
     );
 
-    it.effect("keeps the session when a callback throws, and writes the error to stderr", () =>
+    it.effect("keeps the session when a script or its callback throws, and reports the error", () =>
       Effect.gen(function* () {
         const started = yield* session();
         const evaluate = (code: string) => started.evaluate({ code, tools: [], call: noCalls });
@@ -380,6 +383,9 @@ it.layer(layerTest)("CodeRunner", (it) => {
 
         expect(thrown).toMatchObject({ result: "after", error: null });
         expect(thrown.stderr).toContain("Uncaught error: Error: boom");
+        expect((yield* evaluate("throw Object.create(null);")).error).toBe(
+          "A thrown value that cannot be shown as text.",
+        );
         expect((yield* evaluate("return typeof kept;")).result).toBe("number");
       }),
     );

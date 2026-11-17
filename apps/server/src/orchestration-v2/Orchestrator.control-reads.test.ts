@@ -405,7 +405,7 @@ it.effect(
   () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const events = yield* orchestrator.subscribeDomainEvents;
+      const events = yield* orchestrator.subscribeStoredEvents;
       const threadId = ThreadId.make("thread:subscribed-first");
       yield* orchestrator.dispatch({
         type: "thread.create",
@@ -422,7 +422,7 @@ it.effect(
         creationSource: "web",
       });
       const first = yield* Stream.runHead(events);
-      assert.equal(Option.getOrUndefined(first)?.threadId, threadId);
+      assert.equal(Option.getOrUndefined(first)?.event.threadId, threadId);
     }).pipe(Effect.provide(layerTest)),
 );
 

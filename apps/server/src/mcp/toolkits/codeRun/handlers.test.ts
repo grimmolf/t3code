@@ -80,7 +80,8 @@ const call = Effect.fn("call")(function* (caller: {
         Effect.sync(() => (bound.push([scope.thread.providerSessionId, tool]), null)),
     }),
     Layer.mock(ThreadManagement.ThreadManagementService)({
-      subscribeDomainEvents: Effect.succeed(Stream.never),
+      subscribeStoredEvents: Effect.succeed(Stream.never),
+      getThreadEventSequence: () => Effect.succeed(0),
       getThreadShell: () => Effect.succeed(shell),
       getThreadRecords: (() =>
         Effect.succeed({

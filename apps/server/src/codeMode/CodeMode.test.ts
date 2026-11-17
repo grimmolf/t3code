@@ -1040,44 +1040,57 @@ it.effect("refuses a script whose credential ends while it waits for approval or
 );
 
 it.effect(
-  "ends an idle session when the thread's mode changes, even before its event arrives, but not for an unchanged mode",
+  "ends an idle session when the thread's mode changes, even before its event arrives, but not for an unchanged mode or a change made before it started, and stops retrying a mode that keeps changing",
   () =>
     Effect.gen(function* () {
       const endings = yield* Queue.unbounded<string>();
       const racedId = ThreadId.make("thread:mode-raced");
+      const flappingId = ThreadId.make("thread:mode-flapping");
       const releaseRaced = yield* Deferred.make<void>();
-      // Code Mode hears of the raced thread's mode change, and every later event, only once released.
+      const flapModes: ReadonlyArray<RuntimeMode> = ["auto", "full-access"];
+      let flips = 12;
+      // Code Mode hears of the raced thread's mode changes, and every later event, only once released.
+      // The flapping thread reads as another mode each time, for a while.
       const holdRaced = (threads: Threads): Threads => ({
         ...threads,
-        subscribeDomainEvents: Effect.map(
-          threads.subscribeDomainEvents,
-          Stream.mapEffect((event) =>
-            event.threadId === racedId && event.type === "thread.runtime-mode-updated"
-              ? Deferred.await(releaseRaced).pipe(Effect.as(event))
-              : Effect.succeed(event),
+        subscribeStoredEvents: Effect.map(
+          threads.subscribeStoredEvents,
+          Stream.mapEffect((stored) =>
+            stored.event.threadId === racedId && stored.event.type === "thread.runtime-mode-updated"
+              ? Deferred.await(releaseRaced).pipe(Effect.as(stored))
+              : Effect.succeed(stored),
           ),
         ),
+        getThreadShell: (threadId) =>
+          Effect.map(threads.getThreadShell(threadId), (shell) =>
+            shell === null || threadId !== flappingId || flips === 0
+              ? shell
+              : { ...shell, runtimeMode: flapModes[flips-- % 2]! },
+          ),
       });
       yield* withCodeMode(
-        (codeMode) =>
+        (codeMode, runs) =>
           Effect.gen(function* () {
             const threads = yield* ThreadManagementService.ThreadManagementService;
             const modeChanged = "The thread's mode changed, so its session ended.";
             const raced = yield* startTurn("mode-raced", "full-access");
             yield* runScript(codeMode, raced.threadId, "return 1");
-            yield* threads.dispatch({
-              type: "thread.runtime-mode.set",
-              commandId: CommandId.make("mode:raced"),
-              threadId: raced.threadId,
-              runtimeMode: "auto",
-            });
-            assert.deepEqual(sessionOf(yield* runScript(codeMode, raced.threadId, "return 1")), {
-              status: "done",
-              result: null,
-              sessionStarted: true,
-              notice: modeChanged,
-            });
-            assert.equal(yield* Queue.take(endings), modeChanged);
+            for (const runtimeMode of ["auto", "full-access"] as const) {
+              yield* threads.dispatch({
+                type: "thread.runtime-mode.set",
+                commandId: CommandId.make(`mode:raced:${runtimeMode}`),
+                threadId: raced.threadId,
+                runtimeMode,
+              });
+              assert.deepEqual(sessionOf(yield* runScript(codeMode, raced.threadId, "return 1")), {
+                status: "done",
+                result: null,
+                sessionStarted: true,
+                notice: modeChanged,
+              });
+              assert.equal(yield* Queue.take(endings), modeChanged);
+            }
+            // Both events predate the newest session, so neither ends it.
             yield* Deferred.succeed(releaseRaced, undefined);
 
             const unchanged = yield* startTurn("mode-unchanged", "full-access");
@@ -1112,6 +1125,15 @@ it.effect(
               sessionStarted: true,
               notice: modeChanged,
             });
+
+            const flapping = yield* startTurn("mode-flapping", "full-access");
+            assert.equal(
+              refusal(
+                yield* Effect.exit(runScript(codeMode, flapping.threadId, "return 'flapped'")),
+              ),
+              "CodeModeSessionEndedError",
+            );
+            assert.notInclude(runs, "return 'flapped'");
           }),
         { endings, threads: holdRaced },
       );
@@ -1127,8 +1149,17 @@ it.effect(
       const dropSettings = yield* Deferred.make<void>();
       const withEvents = (threads: Threads): Threads => ({
         ...threads,
-        subscribeDomainEvents: Effect.map(threads.subscribeDomainEvents, (stream) =>
-          Stream.merge(stream, Stream.fromQueue(events)),
+        subscribeStoredEvents: Effect.map(threads.subscribeStoredEvents, (stream) =>
+          Stream.merge(
+            stream,
+            Stream.fromQueue(events).pipe(
+              Stream.map((event) => ({
+                sequence: Number.MAX_SAFE_INTEGER,
+                commandId: null,
+                event,
+              })),
+            ),
+          ),
         ),
       });
       yield* withCodeMode(

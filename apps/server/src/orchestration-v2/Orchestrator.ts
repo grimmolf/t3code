@@ -545,8 +545,8 @@ export interface OrchestratorV2Shape {
   }) => Stream.Stream<OrchestrationV2StoredEvent, OrchestratorV2Error>;
   readonly streamDomainEvents: Stream.Stream<OrchestrationV2DomainEvent, OrchestratorV2Error>;
   /** Its stream holds every event committed after it succeeds, however late it is read. */
-  readonly subscribeDomainEvents: Effect.Effect<
-    Stream.Stream<OrchestrationV2DomainEvent, OrchestratorV2Error>,
+  readonly subscribeStoredEvents: Effect.Effect<
+    Stream.Stream<OrchestrationV2StoredEvent, OrchestratorV2Error>,
     OrchestratorV2Error
   >;
 }
@@ -16310,12 +16310,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     new OrchestratorDomainEventStreamError({ cause });
 
   // Starts at the latest sequence, read now; the stream replays from there when first read.
-  const subscribeDomainEvents = eventSink.latestSequence().pipe(
+  const subscribeStoredEvents = eventSink.latestSequence().pipe(
     Effect.map((latest) =>
-      eventSink.stream({ afterSequence: latest }).pipe(
-        Stream.map((stored) => stored.event),
-        Stream.mapError(domainEventStreamError),
-      ),
+      eventSink.stream({ afterSequence: latest }).pipe(Stream.mapError(domainEventStreamError)),
     ),
     Effect.mapError(domainEventStreamError),
   );
@@ -16543,8 +16540,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             }),
         ),
       ),
-    streamDomainEvents: Stream.unwrap(subscribeDomainEvents),
-    subscribeDomainEvents,
+    streamDomainEvents: Stream.unwrap(subscribeStoredEvents).pipe(
+      Stream.map((stored) => stored.event),
+    ),
+    subscribeStoredEvents,
   });
 });
 

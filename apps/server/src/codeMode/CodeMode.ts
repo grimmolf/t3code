@@ -1,6 +1,6 @@
 import {
   CommandId,
-  type OrchestrationV2DomainEvent,
+  type OrchestrationV2StoredEvent,
   type OrchestrationV2RunStatus,
   type ProviderApprovalOption,
   type ProviderInteractionMode,
@@ -159,6 +159,8 @@ export type CodeRunResult = typeof CodeRunResult.Type;
 export const YIELD_AFTER = Duration.seconds(20);
 export const IDLE_TIMEOUT = Duration.minutes(10);
 export const SESSION_LIMIT = 16;
+/** How many times one call tries to start a script while the thread's mode keeps changing. */
+const MODE_RACE_ATTEMPTS = 3;
 // Kept for threads whose session ended, so their next call can say why and a poll can still
 // read the last evaluation's output.
 const NOTICE_LIMIT = 4 * SESSION_LIMIT;
@@ -289,6 +291,8 @@ interface Session {
   code: CodeRunner.CodeSession | undefined;
   /** The thread's modes when it started; only a session started under the current ones runs. */
   readonly modes: ThreadModes;
+  /** The thread's event sequence read before its modes; mode events up to it are in them. */
+  readonly watermark: number;
   /** Set until its first evaluation starts, with why the thread's previous session ended. */
   fresh: { readonly notice: string | undefined } | undefined;
   /** The latest evaluation, running or done. */
@@ -417,6 +421,10 @@ const make = Effect.gen(function* () {
   const permit = Effect.fn("CodeMode.permit")(function* (threadId: ThreadId) {
     if (!(yield* offered)) return yield* new CodeModeOffError();
     if (unwatched.size > 0) return yield* new CodeModeUnwatchedError();
+    // Read before the shell, so its modes include every event up to it. 0 ignores no event.
+    const sequence = yield* threads
+      .getThreadEventSequence(threadId)
+      .pipe(Effect.orElseSucceed(() => 0));
     const shell = yield* threads.getThreadShell(threadId).pipe(Effect.orElseSucceed(() => null));
     if (shell === null) return yield* new CodeModeNoWorkspaceError({ threadId });
     const running = yield* threads
@@ -437,7 +445,7 @@ const make = Effect.gen(function* () {
           );
     const decision = codeModeDecision({ runtimeMode, interactionMode: shell.interactionMode });
     if (decision === "refuse") return yield* new CodeModeRefusedError();
-    return { shell, runId: running.id, decision };
+    return { shell, sequence, runId: running.id, decision };
   });
 
   /** Drops the session at once, so the next call starts another, and keeps why it ended. */
@@ -516,6 +524,7 @@ const make = Effect.gen(function* () {
     caller: CodeModeCaller,
     cwd: string,
     modes: ThreadModes,
+    watermark: number,
   ) {
     const scope = yield* Scope.fork(layerScope);
     const session: Session = {
@@ -525,6 +534,7 @@ const make = Effect.gen(function* () {
       scope,
       code: undefined,
       modes,
+      watermark,
       fresh: { notice: endings.get(caller.threadId)?.reason },
       evaluation: undefined,
       idle: undefined,
@@ -585,6 +595,7 @@ const make = Effect.gen(function* () {
     runId: RunId,
     cwd: string,
     modes: ThreadModes,
+    watermark: number,
   ) {
     return yield* sessionLocks.withLock(
       input.threadId,
@@ -613,7 +624,7 @@ const make = Effect.gen(function* () {
         const previous = session?.evaluation;
         if (isRunning(previous)) return yield* new CodeModeBusyError({ handle: previous.handle });
         if (session === undefined || code === undefined)
-          ({ session, code } = yield* open(input, cwd, modes));
+          ({ session, code } = yield* open(input, cwd, modes, watermark));
         session.idle = undefined;
         const evaluation: Evaluation = {
           handle: yield* randomUuidV4,
@@ -703,8 +714,9 @@ const make = Effect.gen(function* () {
       ),
     );
     let approved = false;
+    let attempts = 0;
     while (true) {
-      const { shell, decision } = yield* current;
+      const { shell, sequence, decision } = yield* current;
       if (decision === "run" || approved) {
         const cwd =
           shell.worktreePath ??
@@ -716,10 +728,13 @@ const make = Effect.gen(function* () {
         if (cwd === undefined) return yield* new CodeModeNoWorkspaceError({ threadId });
         const started = yield* Effect.uninterruptibleMask((restore) =>
           Effect.gen(function* () {
-            const { session, code, evaluation } = yield* reserve(input, runId, cwd, {
-              runtimeMode: shell.runtimeMode,
-              interactionMode: shell.interactionMode,
-            });
+            const { session, code, evaluation } = yield* reserve(
+              input,
+              runId,
+              cwd,
+              { runtimeMode: shell.runtimeMode, interactionMode: shell.interactionMode },
+              sequence,
+            );
             // Registered first, so a change after this check ends the session instead.
             const recheck = yield* current.pipe(
               Effect.onError(() => cancel(session, evaluation)),
@@ -731,7 +746,10 @@ const make = Effect.gen(function* () {
               !sameModes(session.modes, recheck.shell)
             ) {
               yield* cancel(session, evaluation);
-              return Option.none<CodeRunResult>();
+              if (++attempts < MODE_RACE_ATTEMPTS) return Option.none<CodeRunResult>();
+              // A mode that keeps changing would otherwise hold the call here.
+              yield* end(session, ENDED.modeChanged(undefined));
+              return yield* new CodeModeSessionEndedError({ reason: ENDED.modeChanged(undefined) });
             }
             yield* begin(session, code, evaluation, input).pipe(
               Effect.onError(() => cancel(session, evaluation)),
@@ -816,7 +834,7 @@ const make = Effect.gen(function* () {
   });
 
   // Plain, not Effect.fn: it runs for every domain event in the environment.
-  const onEvent = (event: OrchestrationV2DomainEvent) =>
+  const onEvent = ({ sequence, event }: OrchestrationV2StoredEvent) =>
     Effect.suspend(() => {
       const session = sessions.get(event.threadId);
       if (session === undefined) return Effect.void;
@@ -829,7 +847,8 @@ const make = Effect.gen(function* () {
         case "thread.runtime-mode-updated":
         case "thread.interaction-mode-updated":
           // Even an idle session ends: timers a script left behind would act under the old mode.
-          return sameModes(session.modes, event.payload)
+          // One from before the session started is already in its modes.
+          return sequence <= session.watermark || sameModes(session.modes, event.payload)
             ? Effect.void
             : end(session, ENDED.modeChanged(running?.handle));
         case "thread.archived":
@@ -880,7 +899,7 @@ const make = Effect.gen(function* () {
     );
   };
 
-  yield* keepWatching("the thread event stream", threads.subscribeDomainEvents, onEvent);
+  yield* keepWatching("the thread event stream", threads.subscribeStoredEvents, onEvent);
   yield* keepWatching("credential revocations", registry.subscribeRevocations, (caller) =>
     Effect.suspend(() => {
       const session = sessions.get(caller.threadId);

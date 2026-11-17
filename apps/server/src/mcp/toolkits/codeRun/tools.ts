@@ -63,7 +63,7 @@ const CodeRunTool = Tool.make(T3_CODE_RUN_TOOL_NAME, {
   .annotate(Tool.Meta, { "anthropic/alwaysLoad": true });
 
 const CodePollTool = Tool.make(T3_CODE_POLL_TOOL_NAME, {
-  description: `Wait for an evaluation t3_code_run returned as running, and return its output once it is done. Waits up to waitSeconds, at most and by default ${yieldSeconds}; while it still runs, you get { status: "running" } again.`,
+  description: `Wait for a JavaScript evaluation t3_code_run returned as running, and return its output once it is done. Waits up to waitSeconds, at most and by default ${yieldSeconds}; while it still runs, you get { status: "running" } again.`,
   parameters: Schema.Struct({
     handle: Schema.String.annotate({ description: "The handle t3_code_run returned." }),
     waitSeconds: Schema.optional(

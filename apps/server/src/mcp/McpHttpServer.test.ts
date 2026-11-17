@@ -2062,8 +2062,9 @@ it.effect("lists optional tools to a deferring client only after tool_search loa
       ).toEqual({ tools: [{ name: "preview_open", description: "Opens a browser preview." }] });
       expect(yield* deferring.listed).toEqual(["delegate_task", "preview_open", "tool_search"]);
       expect(yield* other.listed).toEqual(["delegate_task", "preview_open", "schedule_task"]);
+      // One search loads all three, so a handle t3_code_run returns can be polled.
       const codeTools = deferring
-        .call("tool_search", { query: "t3_code_run t3_code_poll t3_code_reset" })
+        .call("tool_search", { query: "javascript" })
         .pipe(
           Effect.map((result) =>
             (result.structuredContent as { tools: ReadonlyArray<{ name: string }> }).tools

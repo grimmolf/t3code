@@ -619,30 +619,58 @@ it.effect("times out a queued script within one deadline and leaves no card open
 );
 
 it.effect("asks for each queued script in turn", () =>
-  withCodeMode((codeMode, runs) =>
-    Effect.gen(function* () {
-      const threads = yield* ThreadManagementService.ThreadManagementService;
-      const cards = (threadId: ThreadId) =>
-        threads
-          .getThreadRecords(threadId, ["runtimeRequests"])
-          .pipe(Effect.map(({ runtimeRequests }) => runtimeRequests.length));
+  Effect.gen(function* () {
+    // Its second shell read is the approval loop's, past the check that refuses a busy session.
+    const shellReads = { counting: false, count: 0, queued: yield* Deferred.make<void>() };
+    yield* withCodeMode(
+      (codeMode, runs) =>
+        Effect.gen(function* () {
+          const threads = yield* ThreadManagementService.ThreadManagementService;
+          const cards = (threadId: ThreadId) =>
+            threads
+              .getThreadRecords(threadId, ["runtimeRequests"])
+              .pipe(Effect.map(({ runtimeRequests }) => runtimeRequests.length));
 
-      const answered = yield* startTurn("queued-answered");
-      const first = yield* startAsking(codeMode, answered.threadId, "return 'first'");
-      const queued = yield* runScript(codeMode, answered.threadId, "return 'second'").pipe(
-        Effect.exit,
-        Effect.forkChild,
-      );
-      const beforeAnswer = yield* threads.getThreadEventSequence(answered.threadId);
-      yield* respond(answered.threadId, first.requestId, "accept");
-      yield* Fiber.join(first.script);
-      const second = yield* pendingCardAfter(answered.threadId, beforeAnswer);
-      assert.equal(yield* cards(answered.threadId), 2);
-      yield* respond(answered.threadId, second, "accept");
-      assert.ok(Exit.isSuccess(yield* Fiber.join(queued)));
-      assert.deepEqual(runs, ["return 'first'", "return 'second'"]);
-    }),
-  ).pipe(Effect.provide(layerTest)),
+          const answered = yield* startTurn("queued-answered");
+          const first = yield* startAsking(codeMode, answered.threadId, "return 'first'");
+          shellReads.counting = true;
+          const queued = yield* runScript(codeMode, answered.threadId, "return 'second'").pipe(
+            Effect.exit,
+            Effect.forkChild,
+          );
+          yield* Deferred.await(shellReads.queued);
+          const beforeAnswer = yield* threads.getThreadEventSequence(answered.threadId);
+          yield* respond(answered.threadId, first.requestId, "accept");
+          yield* Fiber.join(first.script);
+          const second = yield* pendingCardAfter(answered.threadId, beforeAnswer).pipe(
+            Effect.raceFirst(
+              Fiber.await(queued).pipe(
+                Effect.andThen(Effect.die("the queued script finished without asking")),
+              ),
+            ),
+          );
+          assert.equal(yield* cards(answered.threadId), 2);
+          yield* respond(answered.threadId, second, "accept");
+          assert.ok(Exit.isSuccess(yield* Fiber.join(queued)));
+          assert.deepEqual(runs, ["return 'first'", "return 'second'"]);
+        }),
+      {
+        threads: (threads) => ({
+          ...threads,
+          getThreadShell: (threadId) =>
+            threads
+              .getThreadShell(threadId)
+              .pipe(
+                Effect.tap(() =>
+                  shellReads.counting && ++shellReads.count === 2
+                    ? Deferred.succeed(shellReads.queued, undefined)
+                    : Effect.void,
+                ),
+              ),
+        }),
+      },
+    );
+  }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect("asks where the running turn's provider may not run the thread's mode", () =>

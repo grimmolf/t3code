@@ -2,6 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   classifyToolActivity,
+  describeDynamicToolTitle,
   dynamicToolSurface,
   dynamicToolTitle,
   isJavaScriptReplTool,
@@ -54,11 +55,11 @@ describe("toolActivity", () => {
 
   it("presents T3's code tools as JavaScript rows under the names providers report", () => {
     const titles = {
-      t3_code_run: "Run JavaScript",
-      t3_code_poll: "Check JavaScript",
-      t3_code_reset: "Reset JavaScript",
-    };
-    for (const [tool, title] of Object.entries(titles)) {
+      t3_code_run: ["Run JavaScript", "run-javascript"],
+      t3_code_poll: ["Check JavaScript", "check-javascript"],
+      t3_code_reset: ["Reset JavaScript", "reset-javascript"],
+    } as const;
+    for (const [tool, [title, kind]] of Object.entries(titles)) {
       for (const name of [
         `mcp__t3-code__${tool}`,
         `t3-code.${tool}`,
@@ -68,6 +69,12 @@ describe("toolActivity", () => {
       ]) {
         expect(isJavaScriptReplTool(name), name).toBe(true);
         expect(dynamicToolTitle(name, {}), name).toBe(title);
+        // Codex keeps the English default as the row's title; clients still translate it.
+        expect(describeDynamicToolTitle(name, {}, title), name).toEqual({ kind });
+        // Codex can also title the row with the tool's own name, such as "t3 code poll".
+        expect(describeDynamicToolTitle(name, {}, tool.replaceAll("_", " ")), name).toEqual({
+          kind,
+        });
         expect(dynamicToolSurface(name, { code: "await sky.click(app);" })).toBeUndefined();
       }
       expect(isJavaScriptReplTool(`mcp__github__${tool}`)).toBe(false);
@@ -75,5 +82,6 @@ describe("toolActivity", () => {
     expect(
       dynamicToolTitle("t3-code.t3_code_run", { code: "return 1", title: "Rename helpers" }),
     ).toBe("Rename helpers");
+    expect(dynamicToolTitle("t3-code.t3_code_poll", {}, "Wait for rename")).toBe("Wait for rename");
   });
 });

@@ -71,6 +71,19 @@ export function dynamicToolSurface(toolName: string | null | undefined, input: u
     : undefined;
 }
 
+const nameWords = (value: string) =>
+  value
+    .toLowerCase()
+    .replace(/[\s._-]+/g, " ")
+    .trim();
+
+/** Whether `title` only repeats the tool's name, as `t3 code poll` does for `t3-code.t3_code_poll`. */
+const namesTool = (title: string, toolName: string | null | undefined) =>
+  toolName != null &&
+  [toolName, toolName.slice(toolName.lastIndexOf(".") + 1), resolveT3McpToolName(toolName)].some(
+    (name) => name !== null && nameWords(name) === nameWords(title),
+  );
+
 export type DynamicToolTitle =
   | { readonly kind: "title"; readonly title: string }
   | { readonly kind: "computer-use" }
@@ -83,16 +96,21 @@ export function describeDynamicToolTitle(
   retainedTitle?: string | null,
 ): DynamicToolTitle | undefined {
   if (isJavaScriptReplTool(toolName)) {
+    const fallback: DynamicToolTitle =
+      dynamicToolSurface(toolName, input) === "computer"
+        ? { kind: "computer-use" }
+        : { kind: t3CodeToolTitle(toolName) ?? "run-javascript" };
     const title = asTrimmedString(retainedTitle);
+    // Codex titles rows with the tool's name or the English default; both leave the row to the client.
     const meaningfulTitle =
-      title && title.toLowerCase() !== "js" && title.toLowerCase() !== toolName?.toLowerCase()
+      title &&
+      title.toLowerCase() !== "js" &&
+      !namesTool(title, toolName) &&
+      title !== dynamicToolTitleText(fallback)
         ? title
         : undefined;
     const shown = asTrimmedString(asRecord(input)?.title) ?? meaningfulTitle;
-    if (shown) return { kind: "title", title: shown };
-    return dynamicToolSurface(toolName, input) === "computer"
-      ? { kind: "computer-use" }
-      : { kind: t3CodeToolTitle(toolName) ?? "run-javascript" };
+    return shown ? { kind: "title", title: shown } : fallback;
   }
   const skill = claudeSkillInvocation(toolName, input);
   return skill === undefined ? undefined : { kind: "skill", name: skill.name };
@@ -104,9 +122,11 @@ export function dynamicToolTitle(
   retainedTitle?: string | null,
 ): string | undefined {
   const title = describeDynamicToolTitle(toolName, input, retainedTitle);
-  switch (title?.kind) {
-    case undefined:
-      return undefined;
+  return title === undefined ? undefined : dynamicToolTitleText(title);
+}
+
+function dynamicToolTitleText(title: DynamicToolTitle): string {
+  switch (title.kind) {
     case "title":
       return title.title;
     case "computer-use":

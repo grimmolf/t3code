@@ -3706,7 +3706,7 @@
   "19e1f74805f4a1fb": "Agent browser access",
   "74d09db9719594eb": "Allow agents to use the in-app preview browser.",
   "69c3c893d9bc3767": "Code Mode (experimental)",
-  "ffe8ca90a13707cd": "Agents run JavaScript in a session that keeps its values across calls, outside provider rules and hooks. Supervised and Auto-accept edits ask once per thread. Not available on Windows yet.",
+  "ff2830bb1c9d23d0": "Agents run JavaScript in a session that keeps its values across calls, outside provider rules and hooks. Supervised and Auto-accept edits ask before each script until you allow scripts for the thread. Not available on Windows yet.",
   "13087312bc6a0b45": "Pull requests",
   "efb65f53a2382026": "Remove agent credits when merging",
   "88631d9ea293eccd": "Remove recognized agent credits from merge and squash messages on hosts that support it, keeping human co-authors. Includes auto-merge. Excludes merge queues, stack merges, and existing commits.",

@@ -10141,7 +10141,7 @@
   "ef27c4211844aef9": "Posponer",
   "4df30d44eb0b0728": "Reanuda automáticamente los hilos cuando se restablecen sus límites de uso. Puedes cancelar la reanudación automática en cada hilo.",
   "0769f91ca46e3003": "Pospone los hilos hasta que se restablezcan sus límites de uso. Activa la reanudación automática para que el agente continúe tras el restablecimiento.",
-  "ffe8ca90a13707cd": "Los agentes ejecutan JavaScript en una sesión que conserva sus valores entre llamadas, fuera de las reglas y hooks del proveedor. «Supervisado» y «Aceptar ediciones automáticamente» preguntan una vez por hilo. Aún no disponible en Windows.",
+  "ff2830bb1c9d23d0": "Los agentes ejecutan JavaScript en una sesión que conserva sus valores entre llamadas, fuera de las reglas y hooks del proveedor. «Supervisado» y «Aceptar ediciones automáticamente» preguntan antes de cada script hasta que permitas los scripts en el hilo. Aún no disponible en Windows.",
   "7c27e91e75cce7a3": "Resolver automáticamente",
   "cf6c5aa9b63957e6": "Resuelve un hilo cuando se fusiona su pull request. Las pull requests cerradas se siguen resolviendo automáticamente.",
   "ad385f789ba891e3": "Restablecer la resolución automática al fusionar al valor predeterminado",

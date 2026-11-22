@@ -3699,7 +3699,7 @@
   "19e1f74805f4a1fb": "Acceso de agentes al navegador",
   "74d09db9719594eb": "Permite que los agentes usen el navegador de vista previa de la app.",
   "69c3c893d9bc3767": "Code Mode (experimental)",
-  "ffe8ca90a13707cd": "Los agentes ejecutan JavaScript en una sesión que conserva sus valores entre llamadas, fuera de las reglas y hooks del proveedor. «Supervisado» y «Aceptar ediciones automáticamente» preguntan una vez por hilo. Aún no disponible en Windows.",
+  "ff2830bb1c9d23d0": "Los agentes ejecutan JavaScript en una sesión que conserva sus valores entre llamadas, fuera de las reglas y hooks del proveedor. «Supervisado» y «Aceptar ediciones automáticamente» preguntan antes de cada script hasta que permitas los scripts en el hilo. Aún no disponible en Windows.",
   "13087312bc6a0b45": "Pull requests",
   "efb65f53a2382026": "Quitar créditos de agentes al fusionar",
   "88631d9ea293eccd": "Quita los créditos de agentes reconocidos de los mensajes de fusión y squash en los hosts compatibles, manteniendo a los coautores humanos. Incluye la fusión automática. Excluye las colas de fusión, las fusiones de pilas y los commits existentes.",

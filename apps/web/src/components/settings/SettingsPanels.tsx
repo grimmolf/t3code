@@ -2101,7 +2101,7 @@ export function ThreadsSettingsPanel() {
             serverScoped
             {...setting("code-mode")}
             description={gt(
-              "Agents run JavaScript in a session that keeps its values across calls, outside provider rules and hooks. Supervised and Auto-accept edits ask once per thread. Not available on Windows yet.",
+              "Agents run JavaScript in a session that keeps its values across calls, outside provider rules and hooks. Supervised and Auto-accept edits ask before each script until you allow scripts for the thread. Not available on Windows yet.",
             )}
             settingKeys={["codeModeEnabled"]}
             control={

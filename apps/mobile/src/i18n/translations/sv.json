@@ -3705,7 +3705,7 @@
   "19e1f74805f4a1fb": "Agenters webbläsaråtkomst",
   "74d09db9719594eb": "Låt agenter använda förhandsvisningswebbläsaren i appen.",
   "69c3c893d9bc3767": "Code Mode (experimentell)",
-  "ffe8ca90a13707cd": "Agenter kör JavaScript i en session som behåller sina värden mellan anrop, utanför leverantörens regler och hooks. ”Övervakat” och ”Godkänn ändringar automatiskt” frågar en gång per tråd. Inte tillgängligt på Windows än.",
+  "ff2830bb1c9d23d0": "Agenter kör JavaScript i en session som behåller sina värden mellan anrop, utanför leverantörens regler och hooks. ”Övervakat” och ”Godkänn ändringar automatiskt” frågar före varje skript tills du tillåter skript för tråden. Inte tillgängligt på Windows än.",
   "13087312bc6a0b45": "Pull requests",
   "efb65f53a2382026": "Ta bort agentmedförfattare vid merge",
   "88631d9ea293eccd": "Ta bort igenkända agentmedförfattare från merge- och squash-meddelanden hos värdar som stöder det, och behåll mänskliga medförfattare. Gäller även automatisk merge. Gäller inte merge-köer, stack-merges och befintliga commits.",

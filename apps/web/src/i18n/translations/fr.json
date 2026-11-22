@@ -10143,7 +10143,7 @@
   "ef27c4211844aef9": "Report",
   "4df30d44eb0b0728": "Reprend automatiquement les fils quand leurs limites d’utilisation sont réinitialisées. Vous pouvez annuler la reprise automatique dans chaque fil.",
   "0769f91ca46e3003": "Reporte les fils jusqu’à la réinitialisation de leurs limites d’utilisation. Activez la reprise automatique pour que l’agent continue après la réinitialisation.",
-  "ffe8ca90a13707cd": "Les agents exécutent du JavaScript dans une session qui conserve ses valeurs d’un appel à l’autre, hors des règles et hooks du fournisseur. « Supervisé » et « Accepter les modifications automatiquement » demandent une fois par fil. Pas encore disponible sous Windows.",
+  "ff2830bb1c9d23d0": "Les agents exécutent du JavaScript dans une session qui conserve ses valeurs d’un appel à l’autre, hors des règles et hooks du fournisseur. « Supervisé » et « Accepter les modifications automatiquement » demandent avant chaque script, jusqu’à ce que vous autorisiez les scripts pour le fil. Pas encore disponible sous Windows.",
   "7c27e91e75cce7a3": "Clôture automatique",
   "cf6c5aa9b63957e6": "Clôt un fil quand sa pull request est fusionnée. Les pull requests fermées sont toujours closes automatiquement.",
   "ad385f789ba891e3": "Réinitialiser la clôture automatique à la fusion à la valeur par défaut",

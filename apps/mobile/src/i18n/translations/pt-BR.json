@@ -3699,7 +3699,7 @@
   "19e1f74805f4a1fb": "Acesso dos agentes ao navegador",
   "74d09db9719594eb": "Permite que os agentes usem o navegador de pré-visualização do app.",
   "69c3c893d9bc3767": "Code Mode (experimental)",
-  "ffe8ca90a13707cd": "Os agentes executam JavaScript em uma sessão que mantém seus valores entre chamadas, fora das regras e hooks do provedor. \"Supervisionado\" e \"Aceitar edições automaticamente\" perguntam uma vez por thread. Ainda não disponível no Windows.",
+  "ff2830bb1c9d23d0": "Os agentes executam JavaScript em uma sessão que mantém seus valores entre chamadas, fora das regras e hooks do provedor. \"Supervisionado\" e \"Aceitar edições automaticamente\" perguntam antes de cada script até você permitir scripts na thread. Ainda não disponível no Windows.",
   "13087312bc6a0b45": "Pull requests",
   "efb65f53a2382026": "Remover créditos de agentes ao mesclar",
   "88631d9ea293eccd": "Remove os créditos de agentes reconhecidos das mensagens de merge e squash nos hosts que oferecem suporte, mantendo os coautores humanos. Inclui o auto-merge. Exclui merge queues, merges de stack e commits existentes.",

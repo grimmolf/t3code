@@ -10151,7 +10151,7 @@
   "ef27c4211844aef9": "Snooza",
   "4df30d44eb0b0728": "Återuppta trådar automatiskt när deras användningsgränser återställs. Du kan avbryta automatisk återupptagning i varje tråd.",
   "0769f91ca46e3003": "Snooza trådar tills deras användningsgränser återställs. Aktivera automatisk återupptagning för att fortsätta agenten efter återställningen.",
-  "ffe8ca90a13707cd": "Agenter kör JavaScript i en session som behåller sina värden mellan anrop, utanför leverantörens regler och hooks. ”Övervakat” och ”Godkänn ändringar automatiskt” frågar en gång per tråd. Inte tillgängligt på Windows än.",
+  "ff2830bb1c9d23d0": "Agenter kör JavaScript i en session som behåller sina värden mellan anrop, utanför leverantörens regler och hooks. ”Övervakat” och ”Godkänn ändringar automatiskt” frågar före varje skript tills du tillåter skript för tråden. Inte tillgängligt på Windows än.",
   "7c27e91e75cce7a3": "Markera som klar automatiskt",
   "cf6c5aa9b63957e6": "Markera en tråd som klar när dess pull request mergas. Stängda pull requests markeras fortfarande som klara automatiskt.",
   "ad385f789ba891e3": "Återställ markera som klar automatiskt vid merge till standard",

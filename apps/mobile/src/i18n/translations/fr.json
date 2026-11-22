@@ -3699,7 +3699,7 @@
   "19e1f74805f4a1fb": "Accès des agents au navigateur",
   "74d09db9719594eb": "Autorise les agents à utiliser le navigateur d’aperçu intégré.",
   "69c3c893d9bc3767": "Code Mode (expérimental)",
-  "ffe8ca90a13707cd": "Les agents exécutent du JavaScript dans une session qui conserve ses valeurs d’un appel à l’autre, hors des règles et hooks du fournisseur. « Supervisé » et « Accepter les modifications automatiquement » demandent une fois par fil. Pas encore disponible sous Windows.",
+  "ff2830bb1c9d23d0": "Les agents exécutent du JavaScript dans une session qui conserve ses valeurs d’un appel à l’autre, hors des règles et hooks du fournisseur. « Supervisé » et « Accepter les modifications automatiquement » demandent avant chaque script, jusqu’à ce que vous autorisiez les scripts pour le fil. Pas encore disponible sous Windows.",
   "13087312bc6a0b45": "Pull requests",
   "efb65f53a2382026": "Retirer les crédits d’agent lors de la fusion",
   "88631d9ea293eccd": "Retire les crédits d’agent reconnus des messages de fusion et de squash sur les hébergeurs qui le permettent, en gardant les co-auteurs humains. Inclut la fusion automatique. Exclut les files de fusion, les fusions de pile et les commits existants.",

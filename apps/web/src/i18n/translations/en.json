@@ -10153,7 +10153,7 @@
   "ef27c4211844aef9": "Snooze",
   "4df30d44eb0b0728": "Automatically resume threads when their usage limits reset. You can cancel auto-resume in each thread.",
   "0769f91ca46e3003": "Snooze threads until their usage limits reset. Enable auto-resume to continue the agent after the reset.",
-  "ffe8ca90a13707cd": "Agents run JavaScript in a session that keeps its values across calls, outside provider rules and hooks. Supervised and Auto-accept edits ask once per thread. Not available on Windows yet.",
+  "ff2830bb1c9d23d0": "Agents run JavaScript in a session that keeps its values across calls, outside provider rules and hooks. Supervised and Auto-accept edits ask before each script until you allow scripts for the thread. Not available on Windows yet.",
   "7c27e91e75cce7a3": "Auto-settle",
   "cf6c5aa9b63957e6": "Settle a thread when its pull request merges. Closed pull requests still settle automatically.",
   "ad385f789ba891e3": "Reset auto-settle on merge to default",

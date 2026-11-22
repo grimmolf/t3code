@@ -96,21 +96,20 @@ export function describeDynamicToolTitle(
   retainedTitle?: string | null,
 ): DynamicToolTitle | undefined {
   if (isJavaScriptReplTool(toolName)) {
+    const inputTitle = asTrimmedString(asRecord(input)?.title);
+    if (inputTitle) return { kind: "title", title: inputTitle };
     const fallback: DynamicToolTitle =
       dynamicToolSurface(toolName, input) === "computer"
         ? { kind: "computer-use" }
         : { kind: t3CodeToolTitle(toolName) ?? "run-javascript" };
     const title = asTrimmedString(retainedTitle);
     // Codex titles rows with the tool's name or the English default; both leave the row to the client.
-    const meaningfulTitle =
-      title &&
+    return title &&
       title.toLowerCase() !== "js" &&
       !namesTool(title, toolName) &&
       title !== dynamicToolTitleText(fallback)
-        ? title
-        : undefined;
-    const shown = asTrimmedString(asRecord(input)?.title) ?? meaningfulTitle;
-    return shown ? { kind: "title", title: shown } : fallback;
+      ? { kind: "title", title }
+      : fallback;
   }
   const skill = claudeSkillInvocation(toolName, input);
   return skill === undefined ? undefined : { kind: "skill", name: skill.name };

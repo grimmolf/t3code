@@ -4,6 +4,7 @@ import * as Layer from "effect/Layer";
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
 import { HttpServer } from "effect/http";
 import * as NetAddress from "effect/net/NetAddress";
 import * as TestClock from "effect/testing/TestClock";
@@ -36,31 +37,47 @@ const makeRegistry = (now: (() => number) | undefined, httpServer = fakeHttpServ
       Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
     );
 
-it.effect("stores only a token hash, resolves the bearer token, and revokes by thread", () =>
-  Effect.gen(function* () {
-    let timestamp = 1_000;
-    const registry = yield* makeRegistry(() => timestamp);
-    const threadId = ThreadId.make("thread-1");
-    const issued = yield* registry.issue({
-      threadId,
-      providerInstanceId: ProviderInstanceId.make("codex"),
-      capabilities: new Set(["preview"]),
-    });
-    expect(issued.config.endpoint).toBe("http://127.0.0.1:43123/mcp");
-    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
-    expect(token.length).toBeGreaterThan(20);
+it.effect(
+  "stores only a token hash, resolves the bearer token, and announces each credential it revokes",
+  () =>
+    Effect.gen(function* () {
+      let timestamp = 1_000;
+      const registry = yield* makeRegistry(() => timestamp);
+      const threadId = ThreadId.make("thread-1");
+      const issued = yield* registry.issue({
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(["preview"]),
+      });
+      expect(issued.config.endpoint).toBe("http://127.0.0.1:43123/mcp");
+      const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+      expect(token.length).toBeGreaterThan(20);
 
-    const resolved = yield* registry.resolve(token);
-    expect(resolved?.thread.threadId).toBe(threadId);
-    expect(resolved?.capabilities).toEqual(
-      new Set(["preview", "orchestration", "worktree", "pull-requests", "issues"]),
-    );
+      const resolved = yield* registry.resolve(token);
+      expect(resolved?.thread.threadId).toBe(threadId);
+      expect(resolved?.capabilities).toEqual(
+        new Set(["preview", "orchestration", "worktree", "pull-requests", "issues"]),
+      );
 
-    yield* registry.revokeThread(threadId);
-    expect(yield* registry.resolve(token)).toBeUndefined();
+      const revocations = yield* registry.subscribeRevocations;
+      expect(yield* registry.isIssued(issued.config.providerSessionId)).toBe(true);
+      yield* registry.revokeThread(threadId);
+      expect(yield* registry.resolve(token)).toBeUndefined();
+      expect(yield* registry.isIssued(issued.config.providerSessionId)).toBe(false);
+      const other = yield* registry.issue({
+        threadId: ThreadId.make("thread-2"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(),
+      });
+      yield* registry.revokeProviderSession(other.config.providerSessionId);
+      expect(yield* registry.isIssued(other.config.providerSessionId)).toBe(false);
+      expect(Array.from(yield* Stream.runCollect(Stream.take(revocations, 2)))).toEqual([
+        resolved?.thread,
+        expect.objectContaining({ providerSessionId: other.config.providerSessionId }),
+      ]);
 
-    timestamp += 2_000;
-  }),
+      timestamp += 2_000;
+    }),
 );
 
 it.effect("always grants pull-requests and gates browser and device access independently", () =>

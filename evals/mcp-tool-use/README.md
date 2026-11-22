@@ -347,6 +347,10 @@ Errored samples are left out.
 
 Limits: the shell is simulated, so a CLI's output is the simulator's reading of the world and of the error texts the cases copy from real sessions. Polling never really waits, so these runs measure what polling decides, not the wall-clock time it takes. The simulator also sees the whole world, and early runs leaked it into invented files, such as an AGENTS.md naming `cafe` or a Forgejo API on git.cafe. The git.cafe worlds now rule both out. Read failing and passing transcripts before you trust a new case.
 
+## Code Mode cases
+
+`cases/code-mode.ndjson` checks when an agent picks `t3_code_run`, and what it does with a script that is still running. `setup.codeMode` lists the code tools (`t3_code_run`, `t3_code_poll`, `t3_code_reset`) only in these cases, on either harness. Claude gets them loaded up front, as T3 does. Codex gets them as direct functions, such as `mcp__t3_code_direct__t3_code_run`, and not from a code cell, as T3 registers them on Codex's direct-only server. The `bad` case renames a function across 12 modules and should be one script, not `sed -i` or `perl -pi` one-liners. The `guard` case runs the same rename, but the script returns `status: "running"` with a handle, and the agent should poll that handle rather than run the rename again. The control is a single edit, which should not use a script. Mocks answer each script and poll; nothing runs, so these cases measure the choice of tool, not its result. They have no recorded results yet.
+
 ## Where T3's text lives
 
 - `packages/provider-core/src/server/runtimeInstructions.ts`

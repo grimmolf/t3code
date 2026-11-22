@@ -269,6 +269,7 @@ const makeTestRelay = Effect.fnUntraced(function* (
     streamStoredEvents: Stream.empty,
     streamStoredEventsFrom: () => Stream.empty,
     streamDomainEvents: options.domainEvents ?? Stream.empty,
+    subscribeStoredEvents: Effect.succeed(Stream.empty),
   });
   const publications: Array<{
     readonly url: string;

@@ -29,6 +29,8 @@ import {
 } from "@t3tools/contracts";
 
 import packageJson from "../../package.json" with { type: "json" };
+import * as CodeMode from "../codeMode/CodeMode.ts";
+import { CodeToolCallError } from "../codeMode/CodeRunner.ts";
 import { parseBearerToken } from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
 import * as ServerSettings from "../serverSettings.ts";
@@ -81,6 +83,9 @@ import * as WorktreeHandlers from "./toolkits/worktree/handlers.ts";
 import { WorktreeToolkit } from "./toolkits/worktree/tools.ts";
 import * as WorktreeMcpService from "./WorktreeMcpService.ts";
 import * as PullRequestsHandlers from "./toolkits/pullRequests/handlers.ts";
+import * as CodeRunBindings from "./toolkits/codeRun/bindings.ts";
+import * as CodeRunHandlers from "./toolkits/codeRun/handlers.ts";
+import { CodeRunToolkit } from "./toolkits/codeRun/tools.ts";
 import * as ToolSearchHandlers from "./toolkits/toolSearch/handlers.ts";
 import { ToolSearchToolkit } from "./toolkits/toolSearch/tools.ts";
 import { PullRequestsToolkit } from "./toolkits/pullRequests/tools.ts";
@@ -1401,9 +1406,16 @@ const layerToolExposure = Layer.effect(
   McpToolExposure.McpToolExposure,
   Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
+    const codeMode = yield* CodeMode.CodeMode;
+    const codeRunTools: ReadonlySet<string> = new Set(Object.keys(CodeRunToolkit.tools));
     return McpToolExposure.make(
-      () =>
-        server.tools.map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+      codeMode.offered.pipe(
+        Effect.map((codeRunOffered) =>
+          server.tools
+            .filter(({ tool }) => codeRunOffered || !codeRunTools.has(tool.name))
+            .map(({ tool }) => ({ name: tool.name, description: tool.description ?? "" })),
+        ),
+      ),
       () => server.notifications["notifications/tools/list_changed"]({}),
     );
   }),
@@ -1437,4 +1449,159 @@ export const layerToolSearch = Layer.mergeAll(
   layerDeferredListing,
 ).pipe(Layer.provide(layerToolExposure));
 
-export const layer = layerMcpTransport(Layer.mergeAll(layerTools, layerToolSearch));
+/** Hides the code tools, and refuses calls to them, unless Code Mode is on and a thread is calling. */
+const codeRunVisibility = McpServer.visibility(
+  Effect.gen(function* () {
+    const codeMode = yield* CodeMode.CodeMode;
+    // Untraced: it runs on every list request and every call.
+    return Effect.fnUntraced(function* () {
+      const scope = Option.getOrUndefined(
+        yield* Effect.serviceOption(McpInvocationContext.McpInvocationContext),
+      );
+      return scope?.thread !== undefined && scope.client === undefined && (yield* codeMode.offered);
+    });
+  }),
+);
+
+/** Outside layerTools: only threads list it, and only while Code Mode is on. */
+export const layerCodeRunToolkit = toolkitRegistration(CodeRunToolkit, CodeRunHandlers.layer).pipe(
+  Layer.provide(codeRunVisibility.layer),
+);
+
+type BindingTools = (typeof CodeRunBindings.CodeRunBindingToolkit)["tools"];
+
+const decodeJson = Schema.decodeUnknownEffect(Schema.Json);
+const isCodeToolCallError = Schema.is(CodeToolCallError);
+
+/**
+ * Runs each `t3.<tool>()` call through the tool's handler, decoded as a direct call is, with the
+ * credential of the `t3_code_run` call whose evaluation made it.
+ */
+export const layerCodeRunBindings = Layer.effect(
+  CodeRunBindings.CodeRunBindings,
+  Effect.gen(function* () {
+    const toolkit = decodeAsAdvertised(CodeRunBindings.CodeRunBindingToolkit);
+    const tools: Record<string, Tool.Any> = toolkit.tools;
+    for (const tool of Object.values(tools)) {
+      const enabledWhen = Context.getOrUndefined(tool.annotations, McpSchema.EnabledWhen);
+      if (
+        enabledWhen !== undefined &&
+        enabledWhen !== McpInvocationContext.hiddenFromOutsideClients
+      ) {
+        return yield* Effect.die(
+          `${tool.name} can be hidden from a thread, and t3.${tool.name}() would skip that check.`,
+        );
+      }
+    }
+    const built = yield* toolkit;
+    const services =
+      yield* Effect.context<
+        Exclude<
+          Tool.Requirements<BindingTools[keyof BindingTools]>,
+          McpInvocationContext.McpInvocationContext
+        >
+      >();
+    const refuse = (reason: string) => Effect.fail(new CodeToolCallError({ reason }));
+    const failed = (tool: string, error: unknown) =>
+      isOrchestratorMcpFailure(error)
+        ? new CodeToolCallError({ reason: error.message, code: error.code })
+        : new CodeToolCallError({
+            reason: AiError.isAiError(error)
+              ? error.reason.message
+              : error instanceof Error
+                ? error.message
+                : `t3.${tool} failed.`,
+          });
+
+    const call = Effect.fn("CodeRunBindings.call")(
+      function* (
+        scope: McpInvocationContext.McpThreadInvocationScope,
+        tool: string,
+        args: Schema.Json,
+      ) {
+        const definition = Object.hasOwn(tools, tool) ? tools[tool] : undefined;
+        if (definition === undefined) {
+          return yield* refuse(`t3.${tool} is not available to scripts.`);
+        }
+        if (
+          tool === "delegate_task" &&
+          Predicate.hasProperty(args, "mode") &&
+          args.mode === "wait"
+        ) {
+          return yield* refuse(
+            'A script cannot wait on a child: call t3.delegate_task with mode "async", then t3.task_status.',
+          );
+        }
+        const name = tool as keyof BindingTools;
+        const encodeJson = Schema.encodeUnknownEffect(
+          Schema.toCodecJson(Schema.toEncoded(definition.successSchema)),
+        );
+        // Its own span: Toolkit.handle annotates the current one with the raw arguments.
+        return yield* Effect.useSpan(
+          `mcp.tool.${tool}`,
+          { attributes: { "rpc.system": "mcp", "mcp.tool.name": tool, "t3.code_mode": true } },
+          () =>
+            // Decoded by the tool's own parameter schema, as a direct call's arguments are.
+            built.handle(name, args as never).pipe(
+              Stream.unwrap,
+              Stream.runLast,
+              Effect.flatMap(
+                Option.match({
+                  onNone: () => refuse(`t3.${tool} returned nothing.`),
+                  onSome: (handled) =>
+                    handled.isFailure
+                      ? Effect.fail(failed(tool, handled.result))
+                      : encodeJson(handled.encodedResult).pipe(
+                          Effect.flatMap(decodeJson),
+                          Effect.mapError(
+                            () =>
+                              new CodeToolCallError({
+                                reason: `t3.${tool} returned a result that is not JSON.`,
+                              }),
+                          ),
+                        ),
+                }),
+              ),
+              Effect.mapError((error) =>
+                isCodeToolCallError(error) ? error : failed(tool, error),
+              ),
+              Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+              Effect.updateContext((current: Context.Context<never>) =>
+                Context.merge(current, services),
+              ),
+            ),
+        );
+      },
+      (effect, _scope, tool) =>
+        effect.pipe(
+          Effect.catchDefect((defect) =>
+            Effect.logError(`t3.${tool} failed in a script`, { defect }).pipe(
+              Effect.andThen(refuse(`t3.${tool} failed unexpectedly.`)),
+            ),
+          ),
+        ),
+    );
+
+    return CodeRunBindings.CodeRunBindings.of({ tools: Object.keys(tools), call });
+  }),
+).pipe(
+  Layer.provide(
+    Layer.mergeAll(
+      McpToolAccess.HandlersLayer.layer(OrchestratorHandlers.layer),
+      McpToolAccess.HandlersLayer.layer(ThreadHandlers.layer),
+      McpToolAccess.HandlersLayer.layer(ProjectHandlers.layer),
+      McpToolAccess.HandlersLayer.layer(HtmlHandlers.layerRender),
+    ),
+  ),
+  Layer.provide(OrchestratorMcpService.layer),
+  Layer.provide(ThreadMetadataMcpService.layer),
+  Layer.provide(HtmlRender.layer),
+);
+
+export const layer = layerMcpTransport(
+  Layer.mergeAll(
+    layerTools,
+    layerToolSearch,
+    layerCodeRunToolkit.pipe(Layer.provide(layerCodeRunBindings)),
+  ),
+);

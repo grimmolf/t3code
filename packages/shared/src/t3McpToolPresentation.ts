@@ -444,6 +444,18 @@ const T3_MCP_TOOLS: Readonly<Record<string, T3McpToolDefinition>> = {
 
 export const T3_MCP_TOOL_NAMES: ReadonlySet<string> = new Set(Object.keys(T3_MCP_TOOLS));
 
+export const T3_CODE_RUN_TOOL_NAME = "t3_code_run";
+export const T3_CODE_POLL_TOOL_NAME = "t3_code_poll";
+export const T3_CODE_RESET_TOOL_NAME = "t3_code_reset";
+// Shown as JavaScript rows, not T3 tool rows, so they stay out of T3_MCP_TOOLS.
+const T3_CODE_TOOL_NAMES: ReadonlySet<string> = new Set([
+  T3_CODE_RUN_TOOL_NAME,
+  T3_CODE_POLL_TOOL_NAME,
+  T3_CODE_RESET_TOOL_NAME,
+]);
+const isKnownT3Tool = (name: string) =>
+  Object.hasOwn(T3_MCP_TOOLS, name) || T3_CODE_TOOL_NAMES.has(name);
+
 function normalizeT3McpToolLabel(value: string): string {
   return value.replace(/\s+(?:complete|completed)\s*$/i, "").trim();
 }
@@ -454,7 +466,7 @@ const toolNameCache = new Map<string, string | null>();
 const TOOL_NAME_CACHE_LIMIT = 10_000;
 const TOOL_NAME_CACHE_MAX_KEY_LENGTH = 256;
 
-function resolveT3McpToolName(value: string): string | null {
+export function resolveT3McpToolName(value: string): string | null {
   if (value.length > TOOL_NAME_CACHE_MAX_KEY_LENGTH) return parseT3McpToolName(value);
   const cached = toolNameCache.get(value);
   if (cached !== undefined) return cached;
@@ -487,11 +499,11 @@ function parseT3McpToolName(value: string): string | null {
 
   const prefixed = /^(?:mcp[-_]{1,2})?t3[-_ ]?code(?:__|[-_.:/ ])(?<tool>.+)$/i.exec(label);
   const candidate = prefixed?.groups?.tool ?? label;
-  if (Object.hasOwn(T3_MCP_TOOLS, candidate)) return candidate;
+  if (isKnownT3Tool(candidate)) return candidate;
   // OpenCode 2 thread prefixes can contain underscores; choose the longest known tool-name suffix.
   if (!/^t3-code-/i.test(label)) return null;
   let longest: string | null = null;
-  for (const tool of Object.keys(T3_MCP_TOOLS)) {
+  for (const tool of [...Object.keys(T3_MCP_TOOLS), ...T3_CODE_TOOL_NAMES]) {
     if (label.endsWith(`_${tool}`) && tool.length > (longest?.length ?? 0)) longest = tool;
   }
   return longest;

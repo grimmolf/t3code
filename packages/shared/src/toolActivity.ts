@@ -1,5 +1,12 @@
 import type { ToolLifecycleItemType } from "@t3tools/contracts";
 
+import {
+  resolveT3McpToolName,
+  T3_CODE_POLL_TOOL_NAME,
+  T3_CODE_RESET_TOOL_NAME,
+  T3_CODE_RUN_TOOL_NAME,
+} from "./t3McpToolPresentation.ts";
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -24,8 +31,27 @@ export function claudeSkillInvocation(
   return name === undefined ? undefined : { name, args: asTrimmedString(record?.args) };
 }
 
+const T3_CODE_TOOL_TITLES = {
+  [T3_CODE_RUN_TOOL_NAME]: "run-javascript",
+  [T3_CODE_POLL_TOOL_NAME]: "check-javascript",
+  [T3_CODE_RESET_TOOL_NAME]: "reset-javascript",
+} as const;
+
+/** The default row title of one of T3's own JavaScript session tools. */
+const t3CodeToolTitle = (toolName: string | null | undefined) => {
+  const name = toolName == null ? null : resolveT3McpToolName(toolName);
+  return name !== null && Object.hasOwn(T3_CODE_TOOL_TITLES, name)
+    ? T3_CODE_TOOL_TITLES[name as keyof typeof T3_CODE_TOOL_TITLES]
+    : undefined;
+};
+
 export function isJavaScriptReplTool(toolName: string | null | undefined): boolean {
-  return toolName === "js" || toolName === "cua_repl.js" || toolName === "node_repl.js";
+  return (
+    toolName === "js" ||
+    toolName === "cua_repl.js" ||
+    toolName === "node_repl.js" ||
+    t3CodeToolTitle(toolName) !== undefined
+  );
 }
 
 export const COMPUTER_USE_TOOL_SOURCE = {
@@ -36,6 +62,7 @@ export const COMPUTER_USE_TOOL_SOURCE = {
 
 export function dynamicToolSurface(toolName: string | null | undefined, input: unknown) {
   if (toolName === "cua_repl.js") return "computer" as const;
+  if (t3CodeToolTitle(toolName) !== undefined) return undefined;
   const code = asRecord(input)?.code;
   return isJavaScriptReplTool(toolName) &&
     typeof code === "string" &&
@@ -47,7 +74,7 @@ export function dynamicToolSurface(toolName: string | null | undefined, input: u
 export type DynamicToolTitle =
   | { readonly kind: "title"; readonly title: string }
   | { readonly kind: "computer-use" }
-  | { readonly kind: "run-javascript" }
+  | { readonly kind: "run-javascript" | "check-javascript" | "reset-javascript" }
   | { readonly kind: "skill"; readonly name: string };
 
 export function describeDynamicToolTitle(
@@ -65,7 +92,7 @@ export function describeDynamicToolTitle(
     if (shown) return { kind: "title", title: shown };
     return dynamicToolSurface(toolName, input) === "computer"
       ? { kind: "computer-use" }
-      : { kind: "run-javascript" };
+      : { kind: t3CodeToolTitle(toolName) ?? "run-javascript" };
   }
   const skill = claudeSkillInvocation(toolName, input);
   return skill === undefined ? undefined : { kind: "skill", name: skill.name };
@@ -86,6 +113,10 @@ export function dynamicToolTitle(
       return "Computer use";
     case "run-javascript":
       return "Run JavaScript";
+    case "check-javascript":
+      return "Check JavaScript";
+    case "reset-javascript":
+      return "Reset JavaScript";
     case "skill":
       return `Skill: ${title.name}`;
   }

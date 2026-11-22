@@ -1,6 +1,6 @@
 import type { ProviderInteractionMode, RuntimeMode } from "@t3tools/contracts";
 
-/** What a `t3_code_run` call does in a thread: run, ask the user once per thread, or refuse. */
+/** What a `t3_code_run` call does in a thread: run, ask the user (until they allow the thread), or refuse. */
 export type CodeModeDecision = "run" | "ask" | "refuse";
 
 const DECISIONS = {

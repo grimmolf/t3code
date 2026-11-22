@@ -548,6 +548,9 @@ export function useSettingsRestore(onRestored?: () => void) {
     ...(settings.snoozeLimitedThreads !== DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads
       ? [gt("Snooze until limits reset")]
       : []),
+    ...(settings.codeModeEnabled !== DEFAULT_UNIFIED_SETTINGS.codeModeEnabled
+      ? [gt("Code Mode")]
+      : []),
     ...(!Equal.equals(settings.snoozePresets, DEFAULT_UNIFIED_SETTINGS.snoozePresets)
       ? [gt("Snooze options")]
       : []),
@@ -728,6 +731,7 @@ export function useSettingsRestore(onRestored?: () => void) {
       sidebarAutoSettleOnMerge: DEFAULT_UNIFIED_SETTINGS.sidebarAutoSettleOnMerge,
       autoResumeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.autoResumeLimitedThreads,
       snoozeLimitedThreads: DEFAULT_UNIFIED_SETTINGS.snoozeLimitedThreads,
+      codeModeEnabled: DEFAULT_UNIFIED_SETTINGS.codeModeEnabled,
       snoozePresets: DEFAULT_UNIFIED_SETTINGS.snoozePresets,
       responseStreamingMode: DEFAULT_UNIFIED_SETTINGS.responseStreamingMode,
       enableProviderUpdateChecks: DEFAULT_UNIFIED_SETTINGS.enableProviderUpdateChecks,
@@ -1933,6 +1937,11 @@ export function ThreadsSettingsPanel() {
     (environment?.serverConfig
       ? providersByEnvironment.get(environment.environmentId)
       : undefined) ?? EMPTY_SERVER_PROVIDERS;
+  const codeModeUnavailable =
+    hasServerTargets &&
+    connectedEnvironments.every(
+      (target) => target.serverConfig?.environment.platform.os === "windows",
+    );
   const supportsAutoSettlementScope = connectedEnvironments.every(
     (target) => target.serverConfig?.environment.capabilities.threadAutoSettlementScope === true,
   );
@@ -2085,6 +2094,28 @@ export function ThreadsSettingsPanel() {
           }
         />
       </SettingsSection>
+
+      {!isProjectScope ? (
+        <SettingsSection id="code-mode" title={gt("Agent tools")}>
+          <SettingsRow
+            serverScoped
+            {...setting("code-mode")}
+            description={gt(
+              "Agents run JavaScript in a session that keeps its values across calls, outside provider rules and hooks. Supervised and Auto-accept edits ask before each script until you allow scripts for the thread. Not available on Windows yet.",
+            )}
+            settingKeys={["codeModeEnabled"]}
+            control={
+              <ScopedSwitch
+                settingKeys={["codeModeEnabled"]}
+                checked={settings.codeModeEnabled}
+                disabled={codeModeUnavailable}
+                onCheckedChange={(checked) => updateSettings({ codeModeEnabled: Boolean(checked) })}
+                aria-label={gt("Code Mode")}
+              />
+            }
+          />
+        </SettingsSection>
+      ) : null}
 
       {hasServerTargets ? (
         <SettingsSection id="auto-settle" title={gt("Auto-settle")}>

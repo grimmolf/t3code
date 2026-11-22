@@ -20,6 +20,10 @@ export function dynamicToolTitle(
       return resolve(msg("Computer use"));
     case "run-javascript":
       return resolve(msg("Run JavaScript"));
+    case "check-javascript":
+      return resolve(msg("Check JavaScript"));
+    case "reset-javascript":
+      return resolve(msg("Reset JavaScript"));
     case "skill":
       return resolve(msg("Skill: {name}", { name: title.name }));
   }

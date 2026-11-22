@@ -493,6 +493,14 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: [msg("usage quota rate limit reset recover continue")],
   },
   {
+    id: "code-mode",
+    title: msg("Code Mode (experimental)"),
+    to: "/settings/threads",
+    searchTerms: [msg("javascript script batch tool calls context agents experimental")],
+    environmentOnly: true,
+    scope: "environment-defaults",
+  },
+  {
     id: "working-shelf",
     title: msg("Working section"),
     to: "/settings/general",
